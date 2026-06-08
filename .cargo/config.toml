@@ -1,0 +1,10 @@
+[build]
+target = "armv5te-none-eabi.json"
+
+[unstable]
+build-std = ["core", "compiler_builtins"]
+
+[target.'cfg(target_arch = "arm")']
+rustflags = [
+    "-C", "link-arg=-Tlink.lds",
+]

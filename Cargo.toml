@@ -1,0 +1,14 @@
+[package]
+name = "f1c100s"
+version = "0.1.0"
+edition = "2021"
+description = "Rust hardware abstraction library for Allwinner F1C100s (ARM926EJ-S)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+log = { version = "0.4", default-features = false }
+
+[build-dependencies]
+
+[features]
+default = []

@@ -1,0 +1,31 @@
+{
+  "abi": "eabi",
+  "arch": "arm",
+  "asm-args": [
+    "-mthumb-interwork",
+    "-march=armv5te",
+    "-mlittle-endian"
+  ],
+  "atomic-cas": false,
+  "c-enum-min-bits": 8,
+  "crt-objects-fallback": "false",
+  "data-layout": "e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64",
+  "emit-debug-gdb-scripts": false,
+  "features": "+soft-float,+strict-align",
+  "frame-pointer": "always",
+  "has-thumb-interworking": true,
+  "linker": "arm-none-eabi-ld",
+  "linker-flavor": "ld",
+  "llvm-floatabi": "soft",
+  "llvm-target": "armv5te-none-eabi",
+  "max-atomic-width": 0,
+  "metadata": {
+    "description": "Bare Armv5TE for Allwinner F1C100s",
+    "host_tools": false,
+    "std": false,
+    "tier": 3
+  },
+  "panic-strategy": "abort",
+  "relocation-model": "static",
+  "target-pointer-width": 32
+}
