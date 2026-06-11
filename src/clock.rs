@@ -408,6 +408,7 @@ pub enum DramGate {
 }
 
 /// Enable the clock gate for a peripheral
+#[link_section = ".text.spl"]
 pub fn bus_gate_enable(gate: BusGate) {
     let val = gate as u32;
     let offset = val & 0xFFF;
@@ -444,6 +445,7 @@ pub fn bus_gate_disable(gate: BusGate) {
 // ── Software Reset ──────────────────────────────────────────────────────
 
 /// Assert software reset for a peripheral (Bus_Soft_Rst bit=0 → in reset)
+#[link_section = ".text.spl"]
 pub fn sw_reset_assert(gate: BusGate) {
     let val = gate as u32;
     let offset = val & 0xFFF;
@@ -461,6 +463,7 @@ pub fn sw_reset_assert(gate: BusGate) {
 }
 
 /// De-assert software reset for a peripheral (Bus_Soft_Rst bit=1 → normal operation)
+#[link_section = ".text.spl"]
 pub fn sw_reset_deassert(gate: BusGate) {
     let val = gate as u32;
     let offset = val & 0xFFF;
@@ -478,6 +481,7 @@ pub fn sw_reset_deassert(gate: BusGate) {
 }
 
 /// Reset a peripheral: assert, then de-assert the reset line
+#[link_section = ".text.spl"]
 pub fn sw_reset_peripheral(gate: BusGate) {
     sw_reset_assert(gate);
     // Brief delay for reset to take effect
@@ -490,6 +494,7 @@ pub fn sw_reset_peripheral(gate: BusGate) {
 }
 
 /// Enable clock gate and release reset for a peripheral (standard init sequence)
+#[link_section = ".text.spl"]
 pub fn bus_clk_init(gate: BusGate) {
     bus_gate_enable(gate);
     sw_reset_peripheral(gate);

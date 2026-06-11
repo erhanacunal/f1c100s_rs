@@ -244,8 +244,64 @@ pub fn disable_watchdog() {
     }
 }
 
+// ── SPL Debug UART (UART2, PE7=TX / PE8=RX, 115200-8-N-1) ───────────────
+//
+// Raw register pokes only — no string literals, no statics: at SPL time
+// only the `.text.spl` bytes loaded by the BROM exist in SRAM, so anything
+// linked into .rodata/.data (DRAM addresses) must not be touched.
+//
+// Also NO runtime division/modulo anywhere in SPL code: ARM926 has no
+// divide instruction, so `/` and `%` on runtime values compile to
+// `__aeabi_uidiv` libcalls — compiler builtins live in plain `.text`,
+// outside the BROM-loaded region, and the relative `bl` jumps into
+// garbage when running from SRAM.
+
+#[link_section = ".text.spl"]
+unsafe fn spl_uart2_init() {
+    #[inline]
+    unsafe fn rmw(addr: u32, clear: u32, set: u32) {
+        let p = addr as *mut u32;
+        p.write_volatile((p.read_volatile() & !clear) | set);
+    }
+    rmw(0x01C2_0890, 0xF << 28, 0x3 << 28); // PE_CFG0: PE7 = UART2 TX (FUNC2)
+    rmw(0x01C2_0894, 0xF, 0x3);             // PE_CFG1: PE8 = UART2 RX (FUNC2)
+    rmw(0x01C2_0068, 0, 1 << 22);           // CCU BUS_GATE2: UART2 clock
+    rmw(0x01C2_02D0, 0, 1 << 22);           // CCU BUS_SOFT_RST2: UART2 release
+
+    let uart = 0x01C2_5800 as *mut u32;
+    uart.add(1).write_volatile(0);          // IER = 0
+    uart.add(2).write_volatile(0x07);       // FCR: FIFO enable, clear TX/RX
+    uart.add(4).write_volatile(0);          // MCR = 0
+    uart.add(3).write_volatile(0x80);       // LCR: DLAB
+    // 100 MHz APB (clock::init_default) / (115200 * 16) = 54.
+    // Hardcoded: apb_hz() divides at runtime → __aeabi_uidiv libcall,
+    // which is outside the SPL (see module comment above).
+    let div: u32 = 54;
+    uart.write_volatile(div & 0xFF);        // DLL
+    uart.add(1).write_volatile(div >> 8);   // DLH
+    uart.add(3).write_volatile(0x03);       // LCR: 8-N-1, DLAB=0
+}
+
+/// Blocking TX of one byte on the SPL debug UART.
+///
+/// Flushes: waits until the TX FIFO is fully drained before returning, so
+/// a checkpoint character on the wire proves the preceding step completed
+/// (a crash can corrupt at most the character currently shifting out, and
+/// can never silently swallow queued ones).
+#[link_section = ".text.spl"]
+pub unsafe fn spl_putc(c: u8) {
+    let uart = 0x01C2_5800 as *mut u32;
+    while uart.add(0x7C / 4).read_volatile() & 0x2 == 0 {} // USR.TX_FIFO_NOT_FULL
+    uart.write_volatile(c as u32);
+    while uart.add(0x7C / 4).read_volatile() & 0x4 == 0 {} // USR.TX_FIFO_EMPTY
+}
+
 /// Full low-level initialization called from assembly startup.
-/// Initializes clocks and configures GPIO defaults.
+/// Initializes clocks, the SPL debug UART, DRAM, and GPIO defaults.
+///
+/// Silent on a healthy boot. On DRAM init failure it spams 'E' on UART2
+/// forever — continuing would relocate into nonfunctional DRAM and die
+/// without a trace. SPL exception handlers also report on this UART.
 ///
 /// # Safety
 /// This function should only be called once at system startup.
@@ -253,8 +309,18 @@ pub fn disable_watchdog() {
 #[no_mangle]
 pub unsafe extern "C" fn low_level_init() {
     crate::clock::init_default();
-    crate::dram::init();
-    crate::gpio::init_default();    
+    spl_uart2_init();
+
+    if !crate::dram::init() {
+        loop {
+            spl_putc(b'E');
+            for _ in 0..2_000_000 {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    crate::gpio::init_default();
 }
 
 // ── Copy-from-SPI ──────────────────────────────────────────────────────
@@ -342,63 +408,65 @@ pub unsafe extern "C" fn sys_copyself() {
     let image_size: u32 = &__image_end as *const u8 as u32 - dst;
 
     // ── 8. Read entire image from flash to DRAM ────────────────────
-    const CHUNK: u32 = 64; // FIFO depth
-    let mut flash_addr: u32 = 0;
-    let mut remaining: u32 = image_size;
+    //
+    // xboot transfer model (sys-spinor.c, known good on this silicon):
+    // every burst sets MBC = MTC = BCC = n and pushes explicit 0xFF dummy
+    // TX bytes for the receive phase. The "hardware dummy" mode
+    // (MTC=0, BCC=n) is NOT used by xboot on this controller and never
+    // completed on real hardware. CS is asserted once for a single
+    // sequential read of the whole image.
 
-    while remaining > 0 {
+    // Assert CS (SS_LEVEL=0, SS_SEL=0)
+    let mut tcr_val = read32(spi + SPI_TCR);
+    tcr_val &= !((0x3 << 4) | (1 << 7));
+    write32(spi + SPI_TCR, tcr_val);
+
+    // Command phase: read (0x03) from flash offset 0, full-duplex 4 bytes
+    let cmd: [u8; 4] = [0x03, 0, 0, 0];
+    write32(spi + SPI_MBC, 4);
+    write32(spi + SPI_MTC, 4);
+    write32(spi + SPI_BCC, 4);
+    for i in 0..4 {
+        write8(spi + SPI_TXD, cmd[i as usize]);
+    }
+    write32(spi + SPI_TCR, read32(spi + SPI_TCR) | (1 << 31));
+    while read32(spi + SPI_TCR) & (1 << 31) != 0 {}
+    while (read32(spi + SPI_FSR) & 0xFF) < 4 {}
+    for _ in 0..4 {
+        let _ = read8(spi + SPI_RXD); // discard RX clocked during command
+    }
+
+    // Data phase: 64-byte FIFO chunks, dummy TX bytes clock the read out
+    const CHUNK: u32 = 64; // FIFO depth
+    let mut off: u32 = 0;
+    while off < image_size {
+        let remaining = image_size - off;
         let n = if remaining < CHUNK { remaining } else { CHUNK };
 
-        // Assert CS (SS_LEVEL=0, SS_SEL=0)
-        let mut tcr_val = read32(spi + SPI_TCR);
-        tcr_val &= !((0x3 << 4) | (1 << 7));
-        write32(spi + SPI_TCR, tcr_val);
-
-        // Send read command (0x03) + 3 address bytes
-        let cmd: [u8; 4] = [
-            0x03,
-            ((flash_addr >> 16) & 0xFF) as u8,
-            ((flash_addr >> 8) & 0xFF) as u8,
-            (flash_addr & 0xFF) as u8,
-        ];
-
-        // Command phase: 4 TX bytes, RX discarded (MBC=MTC=4 → RX=MBC-MTC=0)
-        write32(spi + SPI_MBC, 4);
-        write32(spi + SPI_MTC, 4);
-        write32(spi + SPI_BCC, 4);
-        for i in 0..4 {
-            write8(spi + SPI_TXD, cmd[i as usize]);
+        write32(spi + SPI_MBC, n);
+        write32(spi + SPI_MTC, n);
+        write32(spi + SPI_BCC, n);
+        for _ in 0..n {
+            write8(spi + SPI_TXD, 0xFF);
         }
 
-        // Trigger command transfer
         write32(spi + SPI_TCR, read32(spi + SPI_TCR) | (1 << 31));
         while read32(spi + SPI_TCR) & (1 << 31) != 0 {}
 
-        // Data phase: MTC=0 → hardware sends dummy bytes and captures n RX bytes
-        write32(spi + SPI_MBC, n);
-        write32(spi + SPI_MTC, 0);
-        write32(spi + SPI_BCC, n);
-
-        // Trigger data transfer
-        write32(spi + SPI_TCR, read32(spi + SPI_TCR) | (1 << 31));
-        while read32(spi + SPI_TCR) & (1 << 31) != 0 {}
-
-        // Read received data bytes and write to correct DRAM address (no +4 offset)
         while (read32(spi + SPI_FSR) & 0xFF) < n {}
         for i in 0..n {
             let byte = read8(spi + SPI_RXD);
-            write8(dst + flash_addr + i, byte);
+            write8(dst + off + i, byte);
         }
 
-        // De-assert CS
-        let mut tcr_val = read32(spi + SPI_TCR);
-        tcr_val &= !((0x3 << 4) | (1 << 7));
-        tcr_val |= 1 << 7; // SS_LEVEL=1 (idle)
-        write32(spi + SPI_TCR, tcr_val);
-
-        flash_addr += n;
-        remaining -= n;
+        off += n;
     }
+
+    // De-assert CS
+    let mut tcr_val = read32(spi + SPI_TCR);
+    tcr_val &= !((0x3 << 4) | (1 << 7));
+    tcr_val |= 1 << 7; // SS_LEVEL=1 (idle)
+    write32(spi + SPI_TCR, tcr_val);
 
     // ── 9. Disable SPI0 ────────────────────────────────────────────
     let gcr_val = read32(spi + SPI_GCR);

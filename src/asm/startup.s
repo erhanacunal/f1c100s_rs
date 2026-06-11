@@ -133,6 +133,27 @@ reset:
     ldmia r0!, {{r2-r8, r10}}
     stmia r1!, {{r2-r8, r10}}
 
+    /* Route exceptions to SPL-resident debug handlers while we run from
+     * SRAM: the normal handlers live past the BROM-loaded region and the
+     * pointer slots hold DRAM link addresses that are not valid yet.
+     * adr produces the current RUN address (SRAM or DRAM), so this works
+     * in both boot paths. _dram_entry restores the normal handlers. */
+    mov r1, #0
+    adr r0, spl_exc_undef
+    str r0, [r1, #0x20]         @ undefined instruction
+    adr r0, spl_exc_swi
+    str r0, [r1, #0x24]         @ software interrupt
+    adr r0, spl_exc_pabt
+    str r0, [r1, #0x28]         @ prefetch abort
+    adr r0, spl_exc_dabt
+    str r0, [r1, #0x2c]         @ data abort
+    adr r0, spl_exc_undef
+    str r0, [r1, #0x30]         @ not_used
+    adr r0, spl_exc_irq
+    str r0, [r1, #0x34]         @ irq
+    adr r0, spl_exc_fiq
+    str r0, [r1, #0x38]         @ fiq
+
     /* Turn off watchdog */
     ldr r0, =WDOG_BASE
     mov r1, #0x0
@@ -149,9 +170,8 @@ reset:
      * resolves to a DRAM address which is invalid before dram::init().
      * Use the top of F1C100s internal SRAM A (32 KB at 0x00000000). */
     ldr sp, =0x00008000
-    ldr r0, =low_level_init
-    blx r0
-    
+    bl low_level_init
+
     /*
      * Speed up: if running from SRAM (adr != ldr _start),
      * copy SPL to DRAM and jump there for faster execution.
@@ -192,20 +212,24 @@ _relocate:
     ldr r0, =_dram_entry
     mov pc, r0
 
+    /* Flush literal pool here: the .text.spl section also accumulates all
+     * Rust #[link_section] functions after this asm, so without .ltorg the
+     * pool lands at the section end — out of ldr's ±4KB range once the
+     * Rust side grows. */
+    .ltorg
+
 /*
  * cpu_init_crit - Critical CPU initialization
  */
 cpu_init_crit:
+    /* Invalidate caches/TLB but do NOT touch the CP15 control register:
+     * xboot's known-good boot leaves the BROM CPU state untouched (only
+     * the V bit is cleared, by reset itself) all the way through clock
+     * and DRAM init. I-cache + alignment checking are enabled later at
+     * _dram_entry, once the SPL phase is over. */
     mov r0, #0
     mcr p15, 0, r0, c7, c7, 0    /* Invalidate both caches */
     mcr p15, 0, r0, c8, c7, 0    /* Invalidate TLB */
-
-    mrc p15, 0, r0, c1, c0, 0
-    bic r0, r0, #0x00002300       /* Clear V[13], I[12], Z[11] */
-    bic r0, r0, #0x00000087       /* Clear B[7], C[2], M[0], A[1] */
-    orr r0, r0, #0x00000002       /* Enable alignment fault checking */
-    orr r0, r0, #0x00001000       /* Enable I-cache */
-    mcr p15, 0, r0, c1, c0, 0
     bx lr
 
 /*
@@ -224,10 +248,170 @@ memcpy:
     mov r0, r3
     bx lr
 
+/*
+ * ── Early UART2 Debug Initialization ──────────────────────────────────
+ *
+ * For debugging only.  Initializes UART2 (PE7=TX, PE8=RX) at 115200-8-N-1
+ * so that boot progress can be monitored via serial before Rust starts.
+ *
+ * early_uart2_init   — GPIO mux + clock gate + reset + baud rate
+ * early_uart2_putc   — blocking TX of a single byte (r0 = char)
+ * early_uart2_puts   — blocking TX of a NUL-terminated string (r0 = ptr)
+ *
+ * Clobbers: r0-r2 (init), r0-r2 (putc), r0-r5 (puts)
+ */
+.section .text.spl
+early_uart2_init:
+    /* ── 1. GPIO mux: PE7 = TX, PE8 = RX (FUNC2 = 0x3) ──────────── */
+    ldr r0, =0x01C20890         @ Port E CFG0 (pins 0-7)
+    ldr r1, [r0]
+    bic r1, r1, #(0xF << 28)    @ Clear PE7 config bits [31:28]
+    orr r1, r1, #(0x3 << 28)    @ FUNC2
+    str r1, [r0]
+
+    ldr r0, =0x01C20894         @ Port E CFG1 (pins 8-15)
+    ldr r1, [r0]
+    bic r1, r1, #0xF            @ Clear PE8 config bits [3:0]
+    orr r1, r1, #0x3            @ FUNC2
+    str r1, [r0]
+
+    /* ── 2. Enable UART2 clock gate (CCU BUS_GATE2, bit 22) ──────── */
+    ldr r0, =0x01C20068         @ CCU_BASE + BUS_GATE2
+    ldr r1, [r0]
+    orr r1, r1, #(1 << 22)
+    str r1, [r0]
+
+    /* ── 3. De-assert UART2 reset (CCU BUS_SOFT_RST2, bit 22) ────── */
+    ldr r0, =0x01C202D0         @ CCU_BASE + BUS_SOFT_RST2
+    ldr r1, [r0]
+    orr r1, r1, #(1 << 22)
+    str r1, [r0]
+
+    /* ── 4. Configure UART2: 115200-8-N-1 ────────────────────────── */
+    ldr r0, =0x01C25800         @ UART2 base
+    mov r1, #0
+    str r1, [r0, #0x04]         @ IER = 0
+    mov r1, #0x07
+    str r1, [r0, #0x08]         @ FCR = 0x07 (enable FIFO, clear TX/RX)
+    mov r1, #0
+    str r1, [r0, #0x10]         @ MCR = 0
+
+    mov r1, #0x80
+    str r1, [r0, #0x0C]         @ LCR = DLAB
+    mov r1, #54                 @ divisor = 100MHz / (115200*16) ≈ 54
+    str r1, [r0, #0x00]         @ DLL
+    mov r1, #0
+    str r1, [r0, #0x04]         @ DLH
+
+    mov r1, #0x03               @ 8-N-1, DLAB=0
+    str r1, [r0, #0x0C]         @ LCR
+
+    bx lr
+
+/*
+ * early_uart2_putc — Send one byte (blocking poll on TX FIFO)
+ *   r0 = character
+ */
+early_uart2_putc:
+    ldr r1, =0x01C25800
+1:  ldr r2, [r1, #0x7C]        @ USR
+    tst r2, #2                  @ TX_FIFO_NOT_FULL (bit 1)
+    beq 1b
+    str r0, [r1, #0x00]         @ THR
+    bx lr
+
+/*
+ * ── SPL exception handlers ────────────────────────────────────────────
+ *
+ * Print the exception cause + banked LR (fault address) on UART2, then
+ * halt. No stack use (banked SPs are uninitialized in exception modes),
+ * no .rodata. LR meaning: data abort = fault PC + 8, prefetch abort /
+ * undef = fault PC + 4.
+ */
+spl_exc_undef:
+    mov r0, #'U'
+    b spl_exc_common
+spl_exc_swi:
+    mov r0, #'W'
+    b spl_exc_common
+spl_exc_pabt:
+    mov r0, #'P'
+    b spl_exc_common
+spl_exc_dabt:
+    mov r0, #'A'
+    b spl_exc_common
+spl_exc_irq:
+    mov r0, #'I'
+    b spl_exc_common
+spl_exc_fiq:
+    mov r0, #'Q'
+    b spl_exc_common
+
+spl_exc_common:
+    mov r4, lr                  @ save fault address (bl clobbers lr)
+    bl early_uart2_putc
+    mov r0, #':'
+    bl early_uart2_putc
+    mov r5, #8                  @ print r4 as 8 hex digits, MSB first
+1:  mov r0, r4, lsr #28
+    cmp r0, #9
+    addls r0, r0, #'0'
+    addhi r0, r0, #('A' - 10)
+    bl early_uart2_putc
+    mov r4, r4, lsl #4
+    subs r5, r5, #1
+    bne 1b
+2:  b 2b                        @ halt
+
+/*
+ * early_uart2_puts — Send a NUL-terminated string
+ *   r0 = pointer to string
+ */
+early_uart2_puts:
+    mov r3, lr                  @ save return address
+    mov r4, r0                  @ save string ptr
+    ldr r5, =0x01C25800         @ UART2 base
+1:  ldrb r0, [r4], #1
+    cmp r0, #0
+    beq 2f
+    @ Wait for TX FIFO not full
+0:  ldr r1, [r5, #0x7C]         @ USR
+    tst r1, #2
+    beq 0b
+    str r0, [r5, #0x00]         @ THR
+    b 1b
+2:  bx r3
+
+    .ltorg                      @ flush UART register-address literals
+
+.section .rodata
+/* Only valid once the full image is in DRAM (after sys_copyself / FEL load) —
+ * .rodata is linked at a DRAM address and is NOT part of the BROM-loaded SPL. */
+early_uart2_banner:
+    .asciz "\r\n[UART2] early init OK\r\n"
+
 .section .text
 _dram_entry:
     /* ── Running from DRAM at 0x80000000 ── */
-    
+
+    /* Restore the normal exception handler pointers — the full image is
+     * in DRAM now, so the link-time slots in _vector are valid again
+     * (reset patched them to the SPL debug handlers). */
+    ldr r0, =_vector
+    ldr r1, =0x00000000
+    ldmia r0!, {{r2-r8, r10}}
+    stmia r1!, {{r2-r8, r10}}
+    ldmia r0!, {{r2-r8, r10}}
+    stmia r1!, {{r2-r8, r10}}
+
+    /* Enable I-cache + alignment fault checking now that the SPL phase
+     * is over (kept at BROM defaults during SPL to match xboot). This is
+     * the CPU state the runtime has always used. */
+    mrc p15, 0, r0, c1, c0, 0
+    orr r0, r0, #0x00000002      /* A: alignment fault checking */
+    orr r0, r0, #0x00001000      /* I: instruction cache */
+    mcr p15, 0, r0, c1, c0, 0
+
     /* Set up stacks for all CPU modes */
     mrs r0, cpsr
     bic r0, r0, #0x1f
@@ -273,6 +457,7 @@ _dram_entry:
     ldr pc, _rust_main
 _rust_main:
     .word rust_main
+    .ltorg                      @ flush _dram_entry's literals (.text grows too)
 
 .section .text
 /*

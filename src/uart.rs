@@ -46,6 +46,7 @@ pub mod lcr {
     pub const PARITY_EN: u32 = 1 << 3;
     pub const STOP_BITS: u32 = 1 << 2;
     // Bits [1:0] = word length: 00=5, 01=6, 10=7, 11=8
+    #[link_section = ".text.spl"]
     pub fn word_len(bits: u32) -> u32 {
         (bits - 5) & 0x3
     }

@@ -178,32 +178,37 @@ unsafe fn dram_delay_scan() -> bool {
 }
 
 /// Calculate and set auto-refresh cycle register.
+///
+/// `clk_hz` — DRAM clock in **Hz** (xboot passes `para->clk * 1000000`).
+/// The internal constants (`10_000_000 >> 6` etc.) are Hz-scale; passing
+/// kHz here computes SREFR = 1 instead of ~1216 and the resulting refresh
+/// storm starves all DRAM accesses (bus hang on first memory read).
 #[link_section = ".text.spl"]
-unsafe fn dram_set_autofresh_cycle(clk_khz: u32) {
+unsafe fn dram_set_autofresh_cycle(clk_hz: u32) {
     let row = (dram_read(reg::SCONR) >> 5) & 0xF;
     let mut val: u32 = 0;
 
     if row == 0xC {
         // 13-row refresh: 7.8 µs period
-        if clk_khz >= 1000 {
-            let mut temp = clk_khz + (clk_khz >> 3) + (clk_khz >> 4) + (clk_khz >> 5);
+        if clk_hz >= 1_000_000 {
+            let mut temp = clk_hz + (clk_hz >> 3) + (clk_hz >> 4) + (clk_hz >> 5);
             while temp >= (10_000_000 >> 6) {
                 temp -= 10_000_000 >> 6;
                 val += 1;
             }
         } else {
-            val = (clk_khz * 499) >> 6;
+            val = (clk_hz * 499) >> 6;
         }
     } else if row == 0xB {
         // 12-row refresh
-        if clk_khz >= 1000 {
-            let mut temp = clk_khz + (clk_khz >> 3) + (clk_khz >> 4) + (clk_khz >> 5);
+        if clk_hz >= 1_000_000 {
+            let mut temp = clk_hz + (clk_hz >> 3) + (clk_hz >> 4) + (clk_hz >> 5);
             while temp >= (10_000_000 >> 7) {
                 temp -= 10_000_000 >> 7;
                 val += 1;
             }
         } else {
-            val = (clk_khz * 499) >> 5;
+            val = (clk_hz * 499) >> 5;
         }
     }
     dram_write(reg::SREFR, val);
@@ -354,15 +359,21 @@ unsafe fn dram_get_dram_size(p: &mut DramParams) {
     dram_scan_readpipe(p);
 
     // Detect column width: write to addresses 0x80000200 and 0x80000600
-    // If they alias (col=9), we'll see 0x22222222 at 0x80000200
+    // If they alias (col=9), we'll see 0x22222222 at 0x80000200.
+    // xboot steps by 1 BYTE here (unaligned u32 writes) and relies on the
+    // legacy ARM926 unaligned behavior (A bit clear). Our cpu_init_crit
+    // enables alignment faults, so an unaligned access data-aborts into an
+    // unloaded vector → hang. Step by 4 instead — the patterns are
+    // byte-uniform and the alias distance is 0x400, so detection semantics
+    // are identical.
     for i in 0..32u32 {
-        ((DRAM_MEM_BASE + 0x200 + i) as *mut u32).write_volatile(0x11111111);
-        ((DRAM_MEM_BASE + 0x600 + i) as *mut u32).write_volatile(0x22222222);
+        ((DRAM_MEM_BASE + 0x200 + 4 * i) as *mut u32).write_volatile(0x11111111);
+        ((DRAM_MEM_BASE + 0x600 + 4 * i) as *mut u32).write_volatile(0x22222222);
     }
 
     let mut count: u32 = 0;
     for i in 0..32u32 {
-        if ((DRAM_MEM_BASE + 0x200 + i) as *const u32).read_volatile() == 0x22222222 {
+        if ((DRAM_MEM_BASE + 0x200 + 4 * i) as *const u32).read_volatile() == 0x22222222 {
             count += 1;
         }
     }
@@ -383,13 +394,14 @@ unsafe fn dram_get_dram_size(p: &mut DramParams) {
         (DRAM_MEM_BASE + 0x200000, DRAM_MEM_BASE + 0x600000)
     };
 
+    // Aligned stepping for the same reason as the column detection above.
     count = 0;
     for i in 0..32u32 {
-        ((addr1 + i) as *mut u32).write_volatile(0x33333333);
-        ((addr2 + i) as *mut u32).write_volatile(0x44444444);
+        ((addr1 + 4 * i) as *mut u32).write_volatile(0x33333333);
+        ((addr2 + 4 * i) as *mut u32).write_volatile(0x44444444);
     }
     for i in 0..32u32 {
-        if ((addr1 + i) as *const u32).read_volatile() == 0x44444444 {
+        if ((addr1 + 4 * i) as *const u32).read_volatile() == 0x44444444 {
             count += 1;
         }
     }
@@ -409,7 +421,7 @@ unsafe fn dram_get_dram_size(p: &mut DramParams) {
         32
     };
 
-    dram_set_autofresh_cycle(p.clk_mhz * 1000);
+    dram_set_autofresh_cycle(p.clk_mhz * 1_000_000);
     p.access_mode = 0;
     dram_para_setup(p);
 }
@@ -455,48 +467,51 @@ pub unsafe fn init() -> bool {
     };
     let pll_val = m | (0u32 << 4) | (n << 8) | (1u32 << 31);
 
-    // Set SDRAM bus gate delay depending on clock speed
-    let soft_rst0_addr = (clock::CCU_BASE + 0x2C0) as *mut u32;
-    if p.clk_mhz >= 144 && p.clk_mhz <= 180 {
-        soft_rst0_addr.write_volatile(0xAAA);
-    } else if p.clk_mhz >= 180 {
-        soft_rst0_addr.write_volatile(0xFFF);
+    // Set SDRAM pad drive strength (PIO SDR_PAD_DRV at GPIO_BASE + 0x2C0).
+    // xboot: write32(0x01c20800 + 0x2c0, ...) — this lives in the PIO block,
+    // not the CCU (CCU_BASE + 0x2C0 is BUS_SOFT_RST0!).
+    let sdr_pad_drv = (GPIO_BASE + 0x2C0) as *mut u32;
+    if p.clk_mhz >= 180 {
+        sdr_pad_drv.write_volatile(0xFFF);
+    } else if p.clk_mhz >= 144 {
+        sdr_pad_drv.write_volatile(0xAAA);
     }
 
-    // Program PLL_DDR and wait for stable
+    // Program PLL_DDR and wait for stable (bounded — a missing lock bit
+    // must fail loudly instead of hanging silently)
     let pll_addr = (clock::CCU_BASE + 0x020) as *mut u32;
     pll_addr.write_volatile(pll_val);
     pll_addr.write_volatile(pll_addr.read_volatile() | (1 << 20)); // latch update
+    let mut timeout: u32 = 0xFFFFFF;
     while pll_addr.read_volatile() & (1 << 28) == 0 {
-        core::hint::spin_loop();
+        timeout -= 1;
+        if timeout == 0 {
+            return false;
+        }
     }
     dram_delay_ms(5);
 
-    // 3. Enable DRAM clock gate and release reset
+    // 3. Enable DRAM clock gate and pulse the controller reset.
+    //    BUS_SOFT_RST0 bit 14: 0 = reset asserted, 1 = running.
     let gate0_addr = (clock::CCU_BASE + 0x060) as *mut u32;
     gate0_addr.write_volatile(gate0_addr.read_volatile() | (1 << 14)); // SDRAM gate enable
 
-    soft_rst0_addr.write_volatile(soft_rst0_addr.read_volatile() & !(1 << 14)); // de-assert reset
-    for _ in 0..10 {
-        core::hint::spin_loop();
-    }
-    soft_rst0_addr.write_volatile(soft_rst0_addr.read_volatile() | (1 << 14)); // re-assert? No - this is wrong. 
-    // Actually looking at the C code more carefully:
-    //   CCU->BUS_SOFT_RST0 &= ~(1 << 14);   // de-assert
-    //   for(i=0;i<10;i++) continue;          // wait
-    //   CCU->BUS_SOFT_RST0 |= (1 << 14);    // assert — Wait, this re-asserts?
-    // No, this is the normal reset sequence: de-assert, then assert (to start with a clean state)
-    // Actually this might be inverted logic on this SoC. Let me follow the C code exactly.
+    let soft_rst0_addr = (clock::CCU_BASE + 0x2C0) as *mut u32;
+    soft_rst0_addr.write_volatile(soft_rst0_addr.read_volatile() & !(1 << 14)); // assert reset
+    dram_delay_ms(1); // xboot uses a ~10-cycle pulse; give the controller real settle time
+    soft_rst0_addr.write_volatile(soft_rst0_addr.read_volatile() | (1 << 14)); // release reset
+    dram_delay_ms(1);
 
-    // 4. Set DDR/SDR type in bus config
-    let bus_soft_rst1_addr = (clock::CCU_BASE + 0x2C4) as *mut u32;
-    let mut bus_cfg = bus_soft_rst1_addr.read_volatile();
+    // 4. Select pad mode for the DRAM type
+    //    (PIO SDR_PAD_PUL at GPIO_BASE + 0x2C4, bit 16: 1 = DDR, 0 = SDR)
+    let sdr_pad_pul = (GPIO_BASE + 0x2C4) as *mut u32;
+    let mut pad_cfg = sdr_pad_pul.read_volatile();
     if p.dram_type == DramType::Ddr {
-        bus_cfg |= 1 << 16;
+        pad_cfg |= 1 << 16;
     } else {
-        bus_cfg &= !(1 << 16);
+        pad_cfg &= !(1 << 16);
     }
-    bus_soft_rst1_addr.write_volatile(bus_cfg);
+    sdr_pad_pul.write_volatile(pad_cfg);
 
     // 5. Set SDRAM timing registers
     let stmg0 = (T_CAS << 0)
@@ -517,22 +532,24 @@ pub unsafe fn init() -> bool {
     dram_write(reg::STMG1R, stmg1);
 
     // 6. Setup DRAM parameters and initialize
-    dram_para_setup(&p);
+    if !dram_para_setup(&p) {
+        return false; // controller init timed out
+    }
 
     // 7. Detect DRAM type (DDR/SDR)
     dram_check_type(&mut p);
 
-    // 8. Update bus config with detected type
-    bus_cfg = bus_soft_rst1_addr.read_volatile();
+    // 8. Update pad mode with detected type
+    pad_cfg = sdr_pad_pul.read_volatile();
     if p.dram_type == DramType::Ddr {
-        bus_cfg |= 1 << 16;
+        pad_cfg |= 1 << 16;
     } else {
-        bus_cfg &= !(1 << 16);
+        pad_cfg &= !(1 << 16);
     }
-    bus_soft_rst1_addr.write_volatile(bus_cfg);
+    sdr_pad_pul.write_volatile(pad_cfg);
 
     // 9. Set auto-refresh and scan read pipe
-    dram_set_autofresh_cycle(p.clk_mhz * 1000);
+    dram_set_autofresh_cycle(p.clk_mhz * 1_000_000);
     dram_scan_readpipe(&mut p);
 
     // 10. Auto-detect size
@@ -550,7 +567,6 @@ pub unsafe fn init() -> bool {
             return false;
         }
     }
-
     // Store magic and size at a known location (used by bootloader chain)
     let dsz = 0x0000005Cu32 as *mut u32;
     dsz.write_volatile(((b'X' as u32) << 24) | p.size_mb);

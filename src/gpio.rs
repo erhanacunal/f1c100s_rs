@@ -326,7 +326,12 @@ pub fn irq_ack(port: Port, pin: Pin) {
 
 // ── Initialisation ──────────────────────────────────────────────────────
 
-/// Set all GPIO pins to disabled state (function 7) except port B
+/// Set all GPIO pins to disabled state (function 7) except port B.
+///
+/// PE7/PE8 (UART2 TX/RX — the SPL debug console) are preserved: this runs
+/// from `low_level_init` while boot diagnostics are still being printed,
+/// and disabling the TX pin mid-frame truncates output and kills all
+/// subsequent SPL logging.
 #[link_section = ".text.spl"]
 pub fn init_default() {
     for port in [Port::A, Port::B, Port::C, Port::D, Port::E, Port::F] {
@@ -335,8 +340,21 @@ pub fn init_default() {
         }
         let base = port_base(port);
         unsafe {
-            wr(base + port_off::CFG + 0x00, 0x7777_7777);
-            wr(base + port_off::CFG + 0x04, 0x7777_7777);
+            if port == Port::E {
+                let c0 = rd(base + port_off::CFG + 0x00);
+                wr(
+                    base + port_off::CFG + 0x00,
+                    (0x7777_7777 & !(0xF << 28)) | (c0 & (0xF << 28)), // keep PE7
+                );
+                let c1 = rd(base + port_off::CFG + 0x04);
+                wr(
+                    base + port_off::CFG + 0x04,
+                    (0x7777_7777 & !0xF) | (c1 & 0xF), // keep PE8
+                );
+            } else {
+                wr(base + port_off::CFG + 0x00, 0x7777_7777);
+                wr(base + port_off::CFG + 0x04, 0x7777_7777);
+            }
             wr(base + port_off::CFG + 0x08, 0x7777_7777);
             wr(base + port_off::CFG + 0x0C, 0x7777_7777);
         }
