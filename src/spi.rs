@@ -230,38 +230,43 @@ impl Spi {
         max_hz: u32,
     ) {
         unsafe {
-            // Disable, then reset
-            self.disable();
-            self.reset_ctrl();
-            self.reset_fifos();
+            // Mirror the proven F1C100s bring-up (xboot sys-spinor.c / the SPL
+            // sys_copyself path that boots this board): clock → reset+enable
+            // (one write, wait for self-clear) → transfer control → FIFO reset.
 
-            // Master mode, full duplex
-            let mut tctrl_val = 0u32;
+            // 1. Clock divider (source: AHB).
+            self.set_clock(max_hz);
 
-            // Set SPI mode (CPOL, CPHA)
+            // 2. Soft-reset + enable in a single GCR write, then wait for the
+            //    reset bit to self-clear. TP_EN pauses TX when the RX FIFO is
+            //    full so long read bursts never drop bytes.
+            spi_write(self.base, reg::CTRL,
+                ctrl::RST | ctrl::TP_EN | ctrl::MODE_MASTER | ctrl::EN);
+            let mut timeout: u32 = 0xFFFFF;
+            while spi_read(self.base, reg::CTRL) & ctrl::RST != 0 && timeout > 0 {
+                timeout -= 1;
+                core::hint::spin_loop();
+            }
+
+            // 3. Transfer control: SPI mode, bit order, software CS, SPOL
+            //    (CS active low / idle high — REQUIRED for SPI NOR; without it
+            //    the chip is never selected and every read returns garbage),
+            //    CS line, and leave CS de-asserted (SS_LEVEL=1) at idle.
+            let mut tctrl_val = tctrl::SS_OWNER_SW | tctrl::SPOL | tctrl::SS_LEVEL;
             match mode {
                 SpiMode::Mode0 => {} // both 0
                 SpiMode::Mode1 => { tctrl_val |= tctrl::CPHA; }
                 SpiMode::Mode2 => { tctrl_val |= tctrl::CPOL; }
                 SpiMode::Mode3 => { tctrl_val |= tctrl::CPOL | tctrl::CPHA; }
             }
-
-            // Bit order
             if order == BitOrder::LsbFirst {
                 tctrl_val |= tctrl::FBS_LSB;
             }
-
-            // Software CS control, select CS line
-            tctrl_val |= tctrl::SS_OWNER_SW;
             tctrl_val |= (cs as u32) << tctrl::SS_SEL_SHIFT;
-
             spi_write(self.base, reg::TCTRL, tctrl_val);
 
-            // Set clock divider (source: AHB)
-            self.set_clock(max_hz);
-
-            // Set master mode and enable
-            spi_write(self.base, reg::CTRL, ctrl::MODE_MASTER | ctrl::EN);
+            // 4. Reset FIFOs.
+            self.reset_fifos();
         }
     }
 
@@ -356,59 +361,55 @@ impl Spi {
             return Ok(());
         }
 
-        unsafe {
-            self.reset_fifos();
+        // Burst the exchange in ≤64-byte (FIFO-sized) chunks, mirroring the
+        // proven F1C100s sequence (xboot sys-spinor.c sys_spi_transfer):
+        //   set MBC/MTC/BCC = n  →  preload the whole TX FIFO  →  start XCH  →
+        //   wait XCH self-clear  →  wait RX FIFO count == n  →  drain.
+        // Loading the TX FIFO *before* starting the exchange is essential;
+        // starting XCH with an empty FIFO clocks garbage.
+        let mut off = 0usize;
+        while off < len {
+            let n = (len - off).min(FIFO_SIZE as usize);
+            unsafe {
+                spi_write(self.base, reg::BC, n as u32);   // MBC: total burst
+                spi_write(self.base, reg::TC, n as u32);   // MTC: bytes transmitted
+                spi_write(self.base, reg::BCC, n as u32);  // BCC: single-mode TX count
 
-            // Set transfer size (only data, no dummy bytes)
-            spi_write(self.base, reg::BC, len as u32);
-            spi_write(self.base, reg::TC, len as u32);
-            spi_write(self.base, reg::BCC, len as u32);
-
-            // Start exchange
-            spi_write(self.base, reg::TCTRL,
-                spi_read(self.base, reg::TCTRL) | tctrl::XCH);
-
-            let mut tx_idx = 0usize;
-            let mut rx_idx = 0usize;
-            let mut tx_remain = len;
-            let mut rx_remain = len;
-
-            while tx_remain > 0 || rx_remain > 0 {
-                // Fill TX FIFO
-                while (self.tx_fifo_count() as u32) < FIFO_SIZE && tx_remain > 0 {
-                    let byte = if tx_idx < tx.len() {
-                        tx[tx_idx]
-                    } else {
-                        0xFFu8
-                    };
+                // Preload TX FIFO (real data, padded with 0xFF for RX-only).
+                for i in 0..n {
+                    let byte = if off + i < tx.len() { tx[off + i] } else { 0xFFu8 };
                     spi_write_byte(self.base, byte);
-                    tx_idx += 1;
-                    tx_remain -= 1;
                 }
 
-                // Drain RX FIFO
-                while self.rx_fifo_count() > 0 && rx_remain > 0 {
-                    let byte = spi_read_byte(self.base);
-                    if rx_idx < rx.len() {
-                        rx[rx_idx] = byte;
+                // Start exchange, wait for it to self-clear.
+                spi_write(self.base, reg::TCTRL,
+                    spi_read(self.base, reg::TCTRL) | tctrl::XCH);
+                let mut timeout: u32 = 0xFFFFF;
+                while spi_read(self.base, reg::TCTRL) & tctrl::XCH != 0 {
+                    if timeout == 0 {
+                        return Err(SpiError::Timeout);
                     }
-                    rx_idx += 1;
-                    rx_remain -= 1;
+                    timeout -= 1;
+                    core::hint::spin_loop();
+                }
+
+                // Wait until all n bytes are in the RX FIFO, then drain them.
+                let mut timeout: u32 = 0xFFFFF;
+                while self.rx_fifo_count() < n as u8 {
+                    if timeout == 0 {
+                        return Err(SpiError::Timeout);
+                    }
+                    timeout -= 1;
+                    core::hint::spin_loop();
+                }
+                for i in 0..n {
+                    let byte = spi_read_byte(self.base);
+                    if off + i < rx.len() {
+                        rx[off + i] = byte;
+                    }
                 }
             }
-
-            // Wait for transfer complete
-            let mut timeout: u32 = 0xFFFFF;
-            while spi_read(self.base, reg::STA) & sta::TC == 0 && timeout > 0 {
-                timeout -= 1;
-                core::hint::spin_loop();
-            }
-            // Clear TC flag
-            spi_write(self.base, reg::STA, sta::TC);
-
-            if timeout == 0 {
-                return Err(SpiError::Timeout);
-            }
+            off += n;
         }
 
         Ok(())
@@ -467,6 +468,33 @@ impl Spi {
         unsafe { self.cs_deassert(); }
         result
     }
+
+    /// Single CS-asserted transaction: send `cmd` (MISO discarded), then receive
+    /// `rx` (clocking 0xFF), then de-assert CS.
+    ///
+    /// SPI NOR read commands (e.g. 0x03) require CS to stay low across the
+    /// command/address bytes AND the data bytes — splitting them into two
+    /// `xfer`/`xfer_receive` calls de-asserts CS in between, aborting the read
+    /// so the data phase returns garbage.
+    pub fn xfer_cmd_read(&self, cmd: &[u8], rx: &mut [u8]) -> Result<(), SpiError> {
+        unsafe { self.cs_assert(); }
+        // Command phase: send cmd bytes, discard whatever the flash drives back.
+        let result = self.transfer(cmd, &mut []).and_then(|_| self.receive(rx));
+        unsafe { self.cs_deassert(); }
+        result
+    }
+
+    /// Single CS-asserted transaction: send `cmd` then send `data` (both TX-only,
+    /// MISO ignored), then de-assert CS.
+    ///
+    /// SPI NOR page-program (0x02) requires CS to stay low across the
+    /// command/address bytes AND the data bytes.
+    pub fn xfer_cmd_send(&self, cmd: &[u8], data: &[u8]) -> Result<(), SpiError> {
+        unsafe { self.cs_assert(); }
+        let result = self.send(cmd).and_then(|_| self.send(data));
+        unsafe { self.cs_deassert(); }
+        result
+    }
 }
 
 /// SPI error types
@@ -477,13 +505,20 @@ pub enum SpiError {
 
 // ── Pre-defined Pin Configurations ────────────────────────────────────────
 
-/// SPI0 pins: PC0=CS, PC1=CLK, PC2=MISO, PC3=MOSI, func1
+/// SPI0 pins: PC0=CS, PC1=CLK, PC2=MISO, PC3=MOSI.
+///
+/// SPI0 is the **first alternate function** on PC0–PC3 — pin-mux value `2`.
+/// In this HAL the `function::FUNCn` constants are off-by-one (`FUNC1 = 0x02`,
+/// `FUNC2 = 0x03`, …), so mux value 2 is `FUNC1`, NOT `FUNC2`. The proven SPL
+/// `sys_copyself` and xboot `sys_spinor_init` both write the literal `2` here;
+/// using `FUNC2` (value 3) muxes the pins to the wrong function so the SPI
+/// signals never reach the chip and every transfer times out (JEDEC reads 00).
 pub const SPI0_PINS: SpiPins = SpiPins {
     clk_port: Port::C, clk_pin: 1,
     mosi_port: Port::C, mosi_pin: 3,
     miso_port: Port::C, miso_pin: 2,
     cs_port: Port::C, cs_pin: 0,
-    pin_func: gpio::function::FUNC2,
+    pin_func: gpio::function::FUNC1,
 };
 
 /// SPI1 pins: PA0=CS, PA1=CLK, PA2=MISO, PA3=MOSI, func5

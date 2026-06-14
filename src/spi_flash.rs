@@ -131,9 +131,10 @@ impl<'a> SpiFlash<'a> {
             ((addr >> 8) & 0xFF) as u8,
             (addr & 0xFF) as u8,
         ];
-        // Send command bytes, then receive data in a second transaction
-        self.spi.xfer(&cmd, &mut [0u8; 4])?; // discard dummy rx during cmd phase
-        self.spi.xfer_receive(buf)?;
+        // Command + address + data MUST share one CS-asserted transaction; a
+        // de-assert between phases aborts the read and the data comes back as
+        // garbage.
+        self.spi.xfer_cmd_read(&cmd, buf)?;
         Ok(())
     }
 
@@ -205,9 +206,10 @@ impl<'a> SpiFlash<'a> {
             ((addr >> 8) & 0xFF) as u8,
             (addr & 0xFF) as u8,
         ];
-        // Send command + data in one CS-asserted transaction
-        self.spi.xfer_send(&cmd)?;
-        self.spi.xfer_send(data)?;
+        // Command + address + data MUST share one CS-asserted transaction; a
+        // de-assert between phases aborts the page program after the address so
+        // no data is written.
+        self.spi.xfer_cmd_send(&cmd, data)?;
         self.wait_busy()?;
         Ok(())
     }
