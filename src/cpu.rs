@@ -244,6 +244,24 @@ pub fn disable_watchdog() {
     }
 }
 
+#[inline]
+unsafe fn read32(addr: u32) -> u32 { (addr as *const u32).read_volatile() }
+#[inline]
+unsafe fn write32(addr: u32, val: u32) { (addr as *mut u32).write_volatile(val); }
+
+pub fn cpu_reset() -> ! {
+    unsafe {
+        let mut val = read32(0x01c20ca0 + 0x18); // Watchdog mode register
+        val &= !(0xf << 4); // Clear existing reset mode
+        val |= (1 << 4) | (0x1 << 0); // Set reset mode to "reset CPU" and enable watchdog
+        write32(0x01c20ca0 + 0x18, val);
+        write32(0x01c20ca0 + 0x10, (0xa57 << 1) | (1 << 0)); // Start watchdog with short timeout
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+}
+
 // ── SPL Debug UART (UART2, PE7=TX / PE8=RX, 115200-8-N-1) ───────────────
 //
 // Raw register pokes only — no string literals, no statics: at SPL time
@@ -359,11 +377,7 @@ pub unsafe extern "C" fn sys_copyself() {
 
     let spi = SPI0_BASE;
 
-    // ── Helper closures (capturing spi by value) ─────────────────────
-    #[inline]
-    unsafe fn read32(addr: u32) -> u32 { (addr as *const u32).read_volatile() }
-    #[inline]
-    unsafe fn write32(addr: u32, val: u32) { (addr as *mut u32).write_volatile(val); }
+    // ── Helper closures (capturing spi by value) ─────────────────────    
     #[inline]
     unsafe fn write8(addr: u32, val: u8) { (addr as *mut u8).write_volatile(val); }
     #[inline]
