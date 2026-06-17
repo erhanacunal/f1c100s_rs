@@ -511,6 +511,46 @@ pub fn output_disable() {
     }
 }
 
+/// Block until the TCON0 timing controller next enters vertical blanking.
+///
+/// DEBE layer-enable / framebuffer-address registers take effect the instant
+/// they are written. Writing them while the panel is actively scanning out
+/// tears the frame (top half = old buffer, bottom half = new). Calling this
+/// first parks the swap in the vertical-blanking gap between frames, so the
+/// change is never visible mid-scanout.
+///
+/// Polls the TCON0 vertical-blank interrupt *flag* — the hardware sets it at the
+/// start of each vblank regardless of whether the interrupt is enabled, so no
+/// IRQ wiring is needed. The flag is cleared first, then awaited, so the call
+/// returns at the *next* vblank edge rather than on a stale flag.
+///
+/// The wait is bounded by the free-running AVS millisecond counter: if the flag
+/// never appears (e.g. output disabled, or the wrong channel), it degrades to an
+/// immediate flip after a few frames instead of stalling indefinitely.
+pub fn wait_for_vsync() {
+    // sun4i/suniv TCON vblank interrupt flag in TCON_INT0 is `BIT(15 - pipe)`.
+    // The RGB panel is driven by TCON0 (pipe 0) → bit 15. (Bit 14 is the TCON1
+    // channel, which is unused here and never fires — polling it just times out,
+    // which stalls every frame.)
+    const TCON0_VB_FLAG: u32 = 1 << 15;
+    // AVS counter 1 (timer block 0x01C2_0C00 + 0x88): free-running, ~0.5 ms per
+    // tick, not reset by `delay_us`. Used purely as a watchdog on the poll.
+    const AVS_CNT1: u32 = 0x01C2_0C88;
+    // ~50 ms — comfortably longer than one frame at any sane refresh, so a
+    // healthy panel always exits on the flag well before this trips.
+    const TIMEOUT_TICKS: u32 = 100;
+    unsafe {
+        // Clear pending flags (TCON interrupts are left disabled).
+        write(TCON_BASE + tcon_reg::INT0, 0);
+        let start = read(AVS_CNT1);
+        while read(TCON_BASE + tcon_reg::INT0) & TCON0_VB_FLAG == 0 {
+            if read(AVS_CNT1).wrapping_sub(start) >= TIMEOUT_TICKS {
+                break;
+            }
+        }
+    }
+}
+
 /// Flip the framebuffer: assign a new buffer to layer 0 and return
 /// the previous buffer address. Caller must clean D-cache before flipping.
 pub fn flip_framebuffer(layer: u8, new_fb: *const u8) -> *const u8 {

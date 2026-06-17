@@ -73,7 +73,11 @@ impl MemDesc {
 
 // ── Page Table ──────────────────────────────────────────────────────────
 
-/// Level 1 page table: 4096 entries, 16KB-aligned
+/// Level 1 page table: 4096 entries, 16KB-aligned.
+///
+/// **MUST be statically allocated** — the MMU hardware reads this table
+/// on every memory access. A stack-local page table is destroyed as soon
+/// as the enclosing function returns, leaving the MMU to walk garbage.
 #[repr(align(16384))]
 pub struct PageTable {
     pub entries: [u32; PAGE_TABLE_ENTRIES],
@@ -91,7 +95,7 @@ impl PageTable {
     /// `vaddr_start` and `vaddr_end` define the virtual address range mapped.
     /// `paddr_start` is the physical start address.
     /// `attr` combines access permissions, domain, cacheability, etc.
-    pub fn set_mapping(&mut self, vaddr_start: u32, vaddr_end: u32, paddr_start: u32, attr: u32) {
+    fn set_mapping(&mut self, vaddr_start: u32, vaddr_end: u32, paddr_start: u32, attr: u32) {
         let start_sec = (vaddr_start >> 20) as usize;
         let end_sec = (vaddr_end >> 20) as usize;
         let paddr_base = paddr_start >> 20;
@@ -102,30 +106,42 @@ impl PageTable {
     }
 
     /// Fill a range from a `MemDesc` descriptor
-    pub fn set_mapping_from_desc(&mut self, desc: &MemDesc) {
+    fn set_mapping_from_desc(&mut self, desc: &MemDesc) {
         self.set_mapping(desc.vaddr_start, desc.vaddr_end, desc.paddr_start, desc.attr);
     }
 
-    /// Fill multiple mappings from a slice of `MemDesc`
-    pub fn set_mappings(&mut self, descs: &[MemDesc]) {
+    /// Fill multiple mappings from a slice of `MemDesc`.
+    /// Descriptors are processed in order; later entries overwrite earlier
+    /// ones, so callers can use overlay ordering (e.g. set entire region
+    /// NCNB first, then carve out CB sub-ranges).
+    fn set_mappings(&mut self, descs: &[MemDesc]) {
         for desc in descs {
             self.set_mapping_from_desc(desc);
         }
     }
 
     /// Get the physical base address of this page table
-    pub fn base_address(&self) -> u32 {
+    fn base_address(&self) -> u32 {
         self as *const Self as u32
     }
 }
+
+// ── Static Page Table ───────────────────────────────────────────────────
+//
+// The page table MUST live in a static so the MMU hardware can read it
+// after mmu::init() returns. A 16KB-aligned static in .bss costs zero
+// flash bytes and is automatically zeroed (all entries invalid).
+// Alignment is inherited from PageTable's #[repr(align(16384))].
+static mut PAGE_TABLE: PageTable = PageTable::new();
 
 // ── MMU Control ─────────────────────────────────────────────────────────
 
 /// Set the Translation Table Base (TTB) register and initialize domains.
 /// This invalidates the TLB, sets all domains to client mode,
-/// then points TTBR0 to the page table.
-pub fn set_ttb(page_table: &PageTable) {
-    let base = page_table.base_address();
+/// then points TTBR0 to the global static page table.
+fn set_ttb() {
+    // Safety: PAGE_TABLE is a static and never moves.
+    let base = unsafe { PAGE_TABLE.base_address() };
     cpu::invalidate_tlb();
     // Set domain access control: all 16 domains as client (01)
     cpu::cp15_write_dacr(0x5555_5555);
@@ -238,35 +254,50 @@ pub fn clean_invalidate_dcache(buffer: u32, size: u32) {
 
 /// Initialize the MMU with the given memory descriptors.
 ///
-/// This is the main entry point for MMU setup. It:
-/// 1. Disables caches and MMU
-/// 2. Invalidates TLB
-/// 3. Fills the page table from descriptors
-/// 4. Sets the TTB register
-/// 5. Enables MMU, I-cache, D-cache
-/// 6. Invalidates caches for clean state
+/// This is the main entry point for MMU setup. It follows the xboot
+/// initialisation sequence:
+///
+/// 1. Disable caches and MMU
+/// 2. Invalidate TLB
+/// 3. Fill the **static** page table from descriptors
+/// 4. Invalidate D-cache (stale pre-MMU lines) and I-cache
+/// 5. Set the TTB register + domain access
+/// 6. Enable MMU, I-cache, D-cache
+/// 7. Invalidate caches again for clean post-enable state
+///
+/// # Safety
+///
+/// Must be called only once, before any cached memory accesses occur.
+/// The page table is stored in a `static mut` that persists for the
+/// lifetime of the system.
 pub fn init(mdesc: &[MemDesc]) {
-    // Disable caches and MMU first
+    // Step 1: Disable caches and MMU
     disable_dcache();
     disable_icache();
     disable_mmu();
     cpu::invalidate_tlb();
 
-    // Create page table and fill from descriptors
-    let mut page_table = PageTable::new();
-    page_table.set_mappings(mdesc);
+    // Step 2: Write descriptors into the static page table.
+    //         Safe: single-threaded init, no other core exists.
+    unsafe {
+        PAGE_TABLE.set_mappings(mdesc);
+    }
 
-    // Set TTB and domain access
-    set_ttb(&page_table);
+    // Step 3: Invalidate caches BEFORE enabling MMU (matches xboot).
+    //         Stale cache lines from the pre-MMU era must not survive
+    //         into the post-MMU world.
+    cpu::invalidate_dcache_all();
+    cpu::invalidate_icache();
 
-    // Enable MMU
+    // Step 4: Point TTBR0 at the static page table
+    set_ttb();
+
+    // Step 5: Enable MMU first, then caches
     enable_mmu();
-
-    // Enable caches
     enable_icache();
     enable_dcache();
 
-    // Invalidate caches for clean state
+    // Step 6: Final invalidation for clean state
     cpu::invalidate_icache();
     cpu::invalidate_dcache_all();
 }

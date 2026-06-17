@@ -24,6 +24,13 @@ context_switch:
     STMFD   SP!, {{LR}}               @ push LR as future PC
     STMFD   SP!, {{R0-R12, LR}}       @ push r0-r12, LR (14 regs)
     MRS     R4, CPSR
+    BIC     R4, R4, #0x80             @ resume with IRQs enabled — a cooperative
+                                      @ switch may be entered from inside an IPC
+                                      @ critical section (IRQs masked); saving the
+                                      @ live I-bit would resume the thread with
+                                      @ IRQs off and never restore them, killing
+                                      @ the timer/scheduler. Threads always resume
+                                      @ runnable, so force I=0 in the saved CPSR.
     STMFD   SP!, {{R4}}               @ push CPSR — frame base
     STR     SP, [R0]                  @ save SP → *from (thread.sp field)
     LDR     SP, [R1]                  @ load SP ← *to
