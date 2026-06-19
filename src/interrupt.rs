@@ -244,15 +244,64 @@ pub unsafe extern "C" fn trap_fiq() {
     dispatch();
 }
 
+// ── DIAGNOSTIC: fault reporting over UART2 ───────────────────────────────────
+// The CPU exception handlers below would otherwise spin silently, making a
+// data abort / bad pointer indistinguishable from a deadlock. These helpers
+// emit the fault type + faulting PC/LR + CP15 Fault Address Register on UART2
+// (raw MMIO, since the UART abstraction is unavailable in abort context) so a
+// memory fault is visible and locatable. Remove once the fault is fixed.
+unsafe fn fault_putc(b: u8) {
+    const UART2_THR: u32 = 0x01C2_5800;
+    const UART2_USR: u32 = 0x01C2_5800 + 0x7C;
+    while core::ptr::read_volatile(UART2_USR as *const u32) & (1 << 1) == 0 {}
+    core::ptr::write_volatile(UART2_THR as *mut u32, b as u32);
+}
+
+unsafe fn fault_puthex(v: u32) {
+    let hex = b"0123456789ABCDEF";
+    let mut shift: i32 = 28;
+    while shift >= 0 {
+        fault_putc(hex[((v >> shift) & 0xF) as usize]);
+        shift -= 4;
+    }
+}
+
+unsafe fn fault_report(tag: u8, frame: &TrapFrame) -> ! {
+    // CP15 Fault Address Register (c6) — the address a data abort tried to touch.
+    let far: u32;
+    core::arch::asm!("mrc p15, 0, {0}, c6, c0, 0", out(reg) far);
+    loop {
+        fault_putc(b'\r');
+        fault_putc(b'\n');
+        fault_putc(b'!');
+        fault_putc(tag); // 'D' data abort, 'P' prefetch abort, 'U' undefined
+        fault_putc(b' ');
+        fault_putc(b'p');
+        fault_putc(b'c');
+        fault_putc(b'=');
+        fault_puthex(frame.pc);
+        fault_putc(b' ');
+        fault_putc(b'l');
+        fault_putc(b'r');
+        fault_putc(b'=');
+        fault_puthex(frame.lr);
+        fault_putc(b' ');
+        fault_putc(b'f');
+        fault_putc(b'a');
+        fault_putc(b'r');
+        fault_putc(b'=');
+        fault_puthex(far);
+        // Crude delay so the line is readable and does not flood.
+        for _ in 0..4_000_000 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
 /// Undefined instruction trap
 #[no_mangle]
 pub unsafe extern "C" fn trap_undef(frame: &TrapFrame) {
-    // In production, would log or invoke debug hooks
-    let _ = frame;
-    // Halt
-    loop {
-        core::arch::asm!("mcr p15, 0, {0}, c7, c0, 4", in(reg) 0u32);
-    }
+    fault_report(b'U', frame)
 }
 
 /// Software interrupt (SWI/SVC) trap
@@ -267,19 +316,13 @@ pub unsafe extern "C" fn trap_swi(frame: &TrapFrame) {
 /// Prefetch abort trap
 #[no_mangle]
 pub unsafe extern "C" fn trap_pabt(frame: &TrapFrame) {
-    let _ = frame;
-    loop {
-        core::arch::asm!("mcr p15, 0, {0}, c7, c0, 4", in(reg) 0u32);
-    }
+    fault_report(b'P', frame)
 }
 
 /// Data abort trap
 #[no_mangle]
 pub unsafe extern "C" fn trap_dabt(frame: &TrapFrame) {
-    let _ = frame;
-    loop {
-        core::arch::asm!("mcr p15, 0, {0}, c7, c0, 4", in(reg) 0u32);
-    }
+    fault_report(b'D', frame)
 }
 
 /// Reserved exception trap

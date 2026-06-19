@@ -551,6 +551,40 @@ pub fn wait_for_vsync() {
     }
 }
 
+// TCON_GINT0 (INT0, 0x04) for the RGB panel on TCON0 (pipe 0): the vblank
+// interrupt *enable* is BIT(31 - pipe) = bit 31, the vblank *status* flag is
+// BIT(15 - pipe) = bit 15. `wait_for_vsync` polls the status; these helpers
+// drive the same bits through the interrupt controller instead.
+const TCON0_VB_INT_ENABLE: u32 = 1 << 31;
+const TCON0_VB_INT_STATUS: u32 = 1 << 15;
+
+/// Enable the TCON0 vertical-blanking interrupt (fires at the start of vblank).
+/// Clears any stale status so the first IRQ corresponds to a real vblank edge.
+/// The caller must also unmask `interrupt::TCON_INTERRUPT` at the INTC.
+pub fn enable_vblank_irq() {
+    // Write enable bit set, status bits clear (status is a plain RW flag here —
+    // `wait_for_vsync` clears it by writing 0).
+    unsafe { write(TCON_BASE + tcon_reg::INT0, TCON0_VB_INT_ENABLE); }
+}
+
+/// Acknowledge a vblank interrupt from the ISR: clear the status flag while
+/// keeping the interrupt enabled.
+///
+/// Do NOT read-modify-write here. The enable bit (31) is not guaranteed to read
+/// back as 1 — if it reads 0, `read() & 0xFFFF_0000` is 0 and writing that back
+/// *disables* the interrupt, so it fires exactly once and never again. Instead
+/// write the enable bit explicitly every ack: bit 31 set re-arms the enable,
+/// bit 15 clear acknowledges the status (the same write-0-clears-status that
+/// `wait_for_vsync` relies on). Idempotent and independent of readback.
+pub fn clear_vblank_irq() {
+    unsafe { write(TCON_BASE + tcon_reg::INT0, TCON0_VB_INT_ENABLE); }
+}
+
+/// True if the TCON0 vblank status flag is currently asserted.
+pub fn vblank_irq_pending() -> bool {
+    unsafe { read(TCON_BASE + tcon_reg::INT0) & TCON0_VB_INT_STATUS != 0 }
+}
+
 /// Flip the framebuffer: assign a new buffer to layer 0 and return
 /// the previous buffer address. Caller must clean D-cache before flipping.
 pub fn flip_framebuffer(layer: u8, new_fb: *const u8) -> *const u8 {

@@ -823,7 +823,16 @@ impl Twi {
             ch.msg_idx = 0;
             ch.msg_ptr = 0;
             ch.msg_num = msg_count;
-            ch.status = XferStatus::Start;
+            // Mark Running BEFORE arming the IRQ and sending START. The TWI ISR
+            // re-enables its own interrupt only while `status == Running`; if it
+            // fires during the `twi_wait_start_clear` poll below (IRQs are
+            // enabled here — this runs on the UI thread, not in a critical
+            // section) and still saw the old `Start`, it would leave the IRQ
+            // disabled and the transfer would stall until the event timeout.
+            // That stall leaves the channel non-Idle, after which every later
+            // call fast-returns Busy without blocking and the caller spins,
+            // starving the scheduler. Setting Running first closes that window.
+            ch.status = XferStatus::Running;
             ch.event.clear(TWI_WAKEUP_EVENT);
 
             // ── Arm interrupt and send START ──────────────────────────
@@ -838,8 +847,6 @@ impl Twi {
                 ch.reset();
                 return Err(I2cError::StartFail);
             }
-
-            ch.status = XferStatus::Running;
 
             // ── Block until ISR completes the transfer ────────────────
             let result = ch.event.wait(
