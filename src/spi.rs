@@ -10,7 +10,7 @@
 //! - 4 hardware chip-select lines (SS0–SS3)
 //! - Clock divider from AHB bus (typically 200 MHz) down to kHz range
 //! - SPI modes 0/1/2/3, MSB/LSB first, full/half duplex
-//! - Max bus clock: 30 MHz
+//! - Max bus clock: 50 MHz (AHB/4; what the xboot SPL reads SPI NOR at)
 //!
 //! ## Clock Calculation
 //! SPI_CLK = AHB_CLK / (2 × (DIV + 1))  for CDR2 mode (DIV ≤ 511)
@@ -101,7 +101,9 @@ mod sta {
 // ── Constants ─────────────────────────────────────────────────────────────
 
 const FIFO_SIZE: u32 = 64;
-const BUS_MAX_CLK: u32 = 30_000_000;
+/// AHB/4 = CDR2 divider 1 (CCR 0x1001), the clock the xboot SPL
+/// (`sys-spinor.c`) boots from SPI NOR with, no sample delay needed.
+const BUS_MAX_CLK: u32 = 50_000_000;
 /// Default AHB clock (200 MHz after standard init)
 const DEFAULT_AHB_HZ: u32 = 200_000_000;
 
