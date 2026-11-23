@@ -51,6 +51,7 @@ runtime dependencies beyond the `log` facade.
 | `timer`       | 3 general-purpose timers + watchdog block                         |
 | `dram`        | DDR/SDR DRAM controller init with auto-detection                  |
 | `lcd`         | Display pipeline: TCON timing + DEBE compositing                  |
+| `fbdma`       | DMA framebuffer ops: fill_rect, blit, scroll (blocking or async)  |
 | `panels`      | Pre-defined LCD panel descriptors                                 |
 | `touch`       | Generic touch input types and coordinate transforms              |
 | `cst8xx`      | CST826 / CST820 / CST816S capacitive touch controller driver     |

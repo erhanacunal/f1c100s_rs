@@ -78,6 +78,7 @@ pub mod clock;
 pub mod cpu;
 pub mod cst8xx;
 pub mod dma;
+pub mod fbdma;
 pub mod dram;
 pub mod gpio;
 pub mod i2c;
