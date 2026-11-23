@@ -15,9 +15,28 @@
 //! ## Clock Calculation
 //! SPI_CLK = AHB_CLK / (2 × (DIV + 1))  for CDR2 mode (DIV ≤ 511)
 //! SPI_CLK = AHB_CLK / (2 × 2^(DIV+1))  for CDR1 mode (DIV > 511)
+//!
+//! ## DMA
+//! After [`Spi::set_dma`] (and [`dma::init`]), [`Spi::send`] and
+//! [`Spi::receive`] move transfers of at least [`DMA_MIN_LEN`] bytes with
+//! two normal DMA channels instead of the CPU. That includes everything
+//! built on them: `xfer_send`, `xfer_receive`, `xfer_cmd_read`,
+//! `xfer_cmd_send`, and so `spi_flash` reads and page programs.
+//! Full-duplex [`Spi::transfer`] stays PIO.
+//!
+//! RX buffers need no special alignment. Only their 32-byte (cache line)
+//! aligned interior goes through DMA; the unaligned head and tail bytes
+//! are read with PIO inside the same CS-asserted transaction. Neighbouring
+//! variables that share the first or last cache line are therefore never
+//! clobbered.
+//!
+//! FIFO DRQ enables (TX bit 24, RX bit 8) and the discard-RX bit (TCR bit
+//! 8) follow Linux `drivers/spi/spi-sun6i.c`.
 
 use crate::clock;
+use crate::dma;
 use crate::gpio::{self, Port, PullMode, DriveLevel};
+use crate::mmu;
 
 // ── Base Addresses ────────────────────────────────────────────────────────
 
@@ -59,7 +78,7 @@ mod tctrl {
     pub const RPSM: u32 = 1 << 10;      // Rapid mode
     pub const SDC: u32 = 1 << 11;       // Sample delay control
     pub const FBS_LSB: u32 = 1 << 12;   // First bit LSB
-    pub const DHB_HALF: u32 = 1 << 8;   // Half-duplex
+    pub const DHB: u32 = 1 << 8;        // Discard RX ("discard hash burst"): TX-only transfers
     pub const SS_LEVEL: u32 = 1 << 7;   // CS level (1=high)
     pub const SS_OWNER_SW: u32 = 1 << 6; // Software CS control
     pub const SS_SEL_SHIFT: u32 = 4;
@@ -72,7 +91,9 @@ mod tctrl {
 #[allow(dead_code)]
 mod fctl {
     pub const TF_RST: u32 = 1 << 31;    // TX FIFO reset
+    pub const TF_DRQ_EN: u32 = 1 << 24; // TX FIFO DMA request enable
     pub const RF_RST: u32 = 1 << 15;    // RX FIFO reset
+    pub const RF_DRQ_EN: u32 = 1 << 8;  // RX FIFO DMA request enable
     pub const TX_TRIG_SHIFT: u32 = 16;
     pub const RX_TRIG_SHIFT: u32 = 0;
 }
@@ -106,6 +127,21 @@ const FIFO_SIZE: u32 = 64;
 const BUS_MAX_CLK: u32 = 50_000_000;
 /// Default AHB clock (200 MHz after standard init)
 const DEFAULT_AHB_HZ: u32 = 200_000_000;
+
+/// Shortest `send` / `receive` that goes through DMA once [`Spi::set_dma`]
+/// is set. Shorter transfers fit in a few FIFO loads and are faster as PIO.
+pub const DMA_MIN_LEN: usize = 256;
+/// Bytes per DMA-driven SPI burst: one NDMA hardware transfer
+/// (`dma::NDMA_MAX_BYTES`), so the SPI never waits on a chunk switch.
+const DMA_BURST_MAX: usize = dma::NDMA_MAX_BYTES as usize;
+/// TX FIFO DMA request level: refill when at most half full.
+const DMA_TX_TRIG: u32 = FIFO_SIZE / 2;
+/// RX FIFO DMA request level: one byte, so the tail of any length drains.
+const DMA_RX_TRIG: u32 = 1;
+/// Poll iterations before a DMA burst is declared stuck (≈ seconds).
+const DMA_TIMEOUT: u32 = 0x0400_0000;
+/// D-cache line size; RX DMA only targets whole lines.
+const LINE: usize = mmu::CACHE_LINE_SIZE as usize;
 
 // ── SPI Mode ──────────────────────────────────────────────────────────────
 
@@ -180,11 +216,19 @@ pub struct SpiPins {
     pub pin_func: u8,
 }
 
+/// The two normal DMA channels an SPI bus uses for TX and RX
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpiDma {
+    pub tx: dma::Channel,
+    pub rx: dma::Channel,
+}
+
 /// A configured hardware SPI bus
 pub struct Spi {
     base: u32,
     gate: clock::BusGate,
     ahb_hz: u32,
+    dma: Option<SpiDma>,
 }
 
 impl Spi {
@@ -193,7 +237,35 @@ impl Spi {
     /// # Safety
     /// Caller must ensure the base address is valid for this CPU.
     pub unsafe fn new(base: u32, gate: clock::BusGate, ahb_hz: u32) -> Self {
-        Self { base, gate, ahb_hz }
+        Self { base, gate, ahb_hz, dma: None }
+    }
+
+    /// Use DMA for `send` / `receive` of at least [`DMA_MIN_LEN`] bytes.
+    ///
+    /// `tx` and `rx` must be two different normal channels (N0–N3), because
+    /// the SPI request lines only exist on NDMA. [`dma::init`] must have run.
+    /// The channels belong to this bus from now on; do not start other
+    /// transfers on them.
+    pub fn set_dma(&mut self, tx: dma::Channel, rx: dma::Channel) -> Result<(), SpiError> {
+        if tx.is_dedicated() || rx.is_dedicated() || tx == rx {
+            return Err(SpiError::Dma(dma::Error::PortMismatch));
+        }
+        self.dma = Some(SpiDma { tx, rx });
+        Ok(())
+    }
+
+    /// Go back to PIO for every transfer.
+    pub fn clear_dma(&mut self) {
+        self.dma = None;
+    }
+
+    /// DMA channels in use, if any
+    pub fn dma(&self) -> Option<SpiDma> {
+        self.dma
+    }
+
+    fn drq(&self) -> dma::NdmaDrq {
+        if self.base == SPI1_BASE { dma::NdmaDrq::Spi1 } else { dma::NdmaDrq::Spi0 }
     }
 
     /// Initialize the SPI bus: configure pins, enable clock gate, release reset.
@@ -417,8 +489,23 @@ impl Spi {
         Ok(())
     }
 
-    /// Send-only SPI transfer (ignores MISO)
+    /// Send-only SPI transfer (ignores MISO).
+    ///
+    /// Uses DMA for `tx.len() >= DMA_MIN_LEN` when [`Spi::set_dma`] is set.
     pub fn send(&self, tx: &[u8]) -> Result<(), SpiError> {
+        if let Some(d) = self.dma {
+            if tx.len() >= DMA_MIN_LEN {
+                for chunk in tx.chunks(DMA_BURST_MAX) {
+                    // SAFETY: `chunk` is borrowed for the whole blocking burst.
+                    unsafe { self.dma_burst(d, Some(chunk.as_ptr() as u32), None, chunk.len() as u32)? };
+                }
+                return Ok(());
+            }
+        }
+        self.send_pio(tx)
+    }
+
+    fn send_pio(&self, tx: &[u8]) -> Result<(), SpiError> {
         // For pure TX, we need to read the same number of bytes from RX FIFO
         // Use a small stack buffer for batches
         let mut rx_buf = [0u8; 64];
@@ -431,8 +518,41 @@ impl Spi {
         Ok(())
     }
 
-    /// Receive-only SPI transfer (sends 0xFF as dummy TX)
+    /// Receive-only SPI transfer.
+    ///
+    /// PIO clocks out 0xFF as dummy TX. The DMA path (`rx.len() >=
+    /// DMA_MIN_LEN` with [`Spi::set_dma`]) lets the controller generate the
+    /// dummy bytes itself, which is fine for SPI NOR data phases. Use PIO
+    /// (no `set_dma`) for devices that require 0xFF on MOSI, such as SD
+    /// cards in SPI mode.
     pub fn receive(&self, rx: &mut [u8]) -> Result<(), SpiError> {
+        if let Some(d) = self.dma {
+            if rx.len() >= DMA_MIN_LEN {
+                // Split into an unaligned head, a cache-line aligned interior
+                // (DMA) and an unaligned tail, all in this one CS window.
+                let start = rx.as_ptr() as usize;
+                let head = ((start + LINE - 1) & !(LINE - 1)) - start;
+                let body = (rx.len() - head) & !(LINE - 1);
+                let (head_buf, rest) = rx.split_at_mut(head);
+                let (body_buf, tail_buf) = rest.split_at_mut(body);
+
+                self.receive_pio(head_buf)?;
+                for chunk in body_buf.chunks_mut(DMA_BURST_MAX) {
+                    let addr = chunk.as_mut_ptr() as u32;
+                    let len = chunk.len() as u32;
+                    // SAFETY: `chunk` is exclusively borrowed for the whole
+                    // blocking burst and covers whole cache lines only.
+                    unsafe { self.dma_burst(d, None, Some(addr), len)? };
+                    // Drop any line the CPU speculatively refetched meanwhile.
+                    mmu::invalidate_dcache(addr, len);
+                }
+                return self.receive_pio(tail_buf);
+            }
+        }
+        self.receive_pio(rx)
+    }
+
+    fn receive_pio(&self, rx: &mut [u8]) -> Result<(), SpiError> {
         let tx = [0xFFu8; 1];
         let mut off = 0;
         while off < rx.len() {
@@ -442,6 +562,86 @@ impl Spi {
             off += chunk;
         }
         Ok(())
+    }
+
+    /// One DMA-driven SPI burst of `len` bytes (≤ `DMA_BURST_MAX`): TX-only
+    /// (`tx` = source address) or RX-only (`rx` = destination address).
+    /// Sequence after Linux `spi-sun6i.c`: FIFO reset + DRQ enable →
+    /// counters → start DMA → XCH → wait for transfer-complete and DMA.
+    ///
+    /// # Safety
+    /// `tx` / `rx` must point to `len` valid bytes that stay untouched by
+    /// the CPU until this returns.
+    unsafe fn dma_burst(&self, d: SpiDma, tx: Option<u32>, rx: Option<u32>, len: u32) -> Result<(), SpiError> {
+        let b = self.base;
+        let drq = self.drq();
+
+        spi_write(b, reg::STA, !0); // clear stale status (W1C)
+        self.reset_fifos();
+        let mut f = (DMA_TX_TRIG << fctl::TX_TRIG_SHIFT) | (DMA_RX_TRIG << fctl::RX_TRIG_SHIFT);
+        if tx.is_some() { f |= fctl::TF_DRQ_EN; }
+        if rx.is_some() { f |= fctl::RF_DRQ_EN; }
+        spi_write(b, reg::FCTL, f);
+
+        // TX-only: discard what comes back so the RX FIFO never fills
+        // (TP_EN would otherwise pause the bus).
+        let t = spi_read(b, reg::TCTRL);
+        spi_write(b, reg::TCTRL, if rx.is_none() { t | tctrl::DHB } else { t & !tctrl::DHB });
+
+        let tx_len = if tx.is_some() { len } else { 0 };
+        spi_write(b, reg::BC, len);     // MBC: total burst
+        spi_write(b, reg::TC, tx_len);  // MTC: bytes from TX FIFO
+        spi_write(b, reg::BCC, tx_len); // BCC/STC: single-mode TX count
+
+        let fifo = |off: u32| dma::Endpoint::ndma(b + off, drq)
+            .width(dma::Width::Bits8).burst(dma::Burst::Single);
+        let mem = |addr: u32| dma::Endpoint::memory(addr)
+            .width(dma::Width::Bits8).burst(dma::Burst::Single);
+
+        let started = (|| -> Result<(), dma::Error> {
+            if let Some(dst) = rx {
+                dma::start(d.rx, &dma::Transfer::new(fifo(reg::RXD), mem(dst), len))?;
+            }
+            if let Some(src) = tx {
+                dma::start(d.tx, &dma::Transfer::new(mem(src), fifo(reg::TXD), len))?;
+            }
+            Ok(())
+        })();
+        let result = match started {
+            Err(e) => Err(SpiError::Dma(e)),
+            Ok(()) => {
+                spi_write(b, reg::TCTRL, spi_read(b, reg::TCTRL) | tctrl::XCH);
+                self.dma_wait(d)
+            }
+        };
+
+        if result.is_err() {
+            dma::stop(d.tx);
+            dma::stop(d.rx);
+        }
+        // Back to the PIO configuration: no DRQs, RX kept.
+        spi_write(b, reg::FCTL, 0);
+        spi_write(b, reg::TCTRL, spi_read(b, reg::TCTRL) & !(tctrl::DHB | tctrl::XCH));
+        result
+    }
+
+    /// Wait for the SPI exchange to finish and both DMA channels to go idle.
+    fn dma_wait(&self, d: SpiDma) -> Result<(), SpiError> {
+        let mut timeout = DMA_TIMEOUT;
+        loop {
+            let xch = unsafe { spi_read(self.base, reg::TCTRL) } & tctrl::XCH != 0;
+            // poll() also advances the channels when IRQs are off.
+            let tx_busy = dma::poll(d.tx);
+            let rx_busy = dma::poll(d.rx);
+            if !xch && !tx_busy && !rx_busy {
+                unsafe { spi_write(self.base, reg::STA, sta::TC) };
+                return Ok(());
+            }
+            if timeout == 0 {
+                return Err(SpiError::Timeout);
+            }
+            timeout -= 1;
+        }
     }
 
     // ── Convenience with CS control ────────────────────────────────────
@@ -503,6 +703,9 @@ impl Spi {
 #[derive(Debug)]
 pub enum SpiError {
     Timeout,
+    /// A DMA channel could not be started (e.g. `dma::init` not called,
+    /// channel busy)
+    Dma(dma::Error),
 }
 
 // ── Pre-defined Pin Configurations ────────────────────────────────────────

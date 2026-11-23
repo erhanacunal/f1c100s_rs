@@ -17,3 +17,7 @@ default = []
 [[example]]
 name = "dma_demo"
 path = "docs/examples/dma_demo.rs"
+
+[[example]]
+name = "spi_dma_demo"
+path = "docs/examples/spi_dma_demo.rs"

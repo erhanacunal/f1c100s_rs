@@ -44,7 +44,7 @@ runtime dependencies beyond the `log` facade.
 | `gpio`        | GPIO ports A–F, with edge/level interrupts on ports D/E/F          |
 | `uart`        | Three 16550-compatible UARTs (64-byte FIFOs)                       |
 | `i2c`         | Three TWI/I²C master controllers (standard + fast mode)           |
-| `spi`         | Hardware SPI (SPI0 / SPI1)                                         |
+| `spi`         | Hardware SPI (SPI0 / SPI1), optional DMA for send/receive          |
 | `soft_spi`    | GPIO bit-banged SPI (incl. 9-bit mode for LCD panels)             |
 | `spi_flash`   | SPI NOR flash (Winbond W25Qxx, GigaDevice GD25Qxx, …)             |
 | `pwm`         | Two 16-bit PWM channels                                            |

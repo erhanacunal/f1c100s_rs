@@ -593,15 +593,25 @@ pub fn is_busy(channel: Channel) -> bool {
 /// serviced here too, so multi-chunk transfers progress either way. For a
 /// cyclic transfer this only returns after [`stop`].
 pub fn wait(channel: Channel) {
-    while is_busy(channel) {
-        critical(|| unsafe {
-            let pending = rd(reg::INT_STA) & channel.irq_mask();
-            if pending != 0 {
-                wr(reg::INT_STA, pending);
-                service(channel, pending);
-            }
-        });
+    while poll(channel) {}
+}
+
+/// Non-blocking progress check: service any pending status bits of
+/// `channel` (so it also advances with interrupts disabled) and return
+/// `true` while the transfer is still running. Use it to build a wait loop
+/// with a timeout; [`wait`] is `while poll(ch) {}`.
+pub fn poll(channel: Channel) -> bool {
+    if !is_busy(channel) {
+        return false;
     }
+    critical(|| unsafe {
+        let pending = rd(reg::INT_STA) & channel.irq_mask();
+        if pending != 0 {
+            wr(reg::INT_STA, pending);
+            service(channel, pending);
+        }
+    });
+    is_busy(channel)
 }
 
 /// Bytes already moved by the current / last one-shot transfer
