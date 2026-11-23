@@ -83,6 +83,30 @@ cargo build --release
 The target, `build-std`, and linker script are all wired up through
 `.cargo/config.toml`, so a plain `cargo build` Just Works.
 
+### Flashing (xfel)
+
+`tools/flash.ps1` builds an image, converts it to a raw binary, fixes the
+eGON boot header with `mksunxi`, and loads it over USB FEL with `xfel`
+(`tools/xfel.exe`, plus `libusb-1.0.dll` in `tools/xfel/`). Put the board in
+FEL mode first: hold BOOT, or boot with no valid flash.
+
+```powershell
+.	oolslash.ps1                                   # build dma_demo and run it from RAM
+.	oolslash.ps1 -Example dma_demo -Mode flash     # write it to SPI NOR at offset 0, then reset
+.	oolslash.ps1 -Mode build                       # only produce the .bin
+.	oolslash.ps1 -Elf <path-to-elf> -Mode ram      # load an ELF built by another crate
+```
+
+`-Mode ram` runs `xfel ddr f1c100s`, then `write 0x80000000`, then
+`exec 0x80000000`. The startup code sees the FEL flag and skips the flash
+copy, so nothing on the board changes permanently.
+
+For a quick edit-and-run loop, call `uart.poll_dev_keys()` from the main
+loop. Pressing `f` on the console UART calls `cpu::enter_fel()`, which puts
+the board back into FEL so it is ready for the next `flash.ps1` without
+pressing BOOT. Pressing `r` resets the board. `enter_fel()` works whether the
+board was started from SPI flash or with `xfel exec`.
+
 ## Usage
 
 Add the crate as a dependency in your binary crate and provide a `rust_main`

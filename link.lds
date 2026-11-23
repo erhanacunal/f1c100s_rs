@@ -14,6 +14,7 @@ SECTIONS
         /* ── SPL: Exception vectors & BROM header ───────────────────── */
         PROVIDE(__image_start = .);
         KEEP(*(.vectors))
+        KEEP(*(.text.boot))
 
         /* ── SPL: Critical early-init functions (clock, dram, uart) ─── */
         *(.text.spl)

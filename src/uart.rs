@@ -228,6 +228,34 @@ impl Uart {
         self.write(s.as_bytes());
     }
 
+    /// Block until every queued byte has left the transmitter
+    /// (TX FIFO and shift register empty).
+    pub fn flush(&self) {
+        while self.rd(reg::LSR) & lsr::TX_EMPTY == 0 {}
+    }
+
+    /// Development console keys, to call from an idle / main loop:
+    ///
+    /// - `f` — return to FEL mode (`cpu::enter_fel`), ready for `xfel`
+    /// - `r` — watchdog reset (`cpu::cpu_reset`)
+    ///
+    /// Other keys are ignored. Returns without blocking if nothing was typed.
+    pub fn poll_dev_keys(&self) {
+        match self.read_byte() {
+            Some(b'f') | Some(b'F') => {
+                self.write_str("\r\n[dev] entering FEL mode\r\n");
+                self.flush();
+                crate::cpu::enter_fel();
+            }
+            Some(b'r') | Some(b'R') => {
+                self.write_str("\r\n[dev] reset\r\n");
+                self.flush();
+                crate::cpu::cpu_reset();
+            }
+            _ => {}
+        }
+    }
+
     // ── Polling RX ───────────────────────────────────────────────────
 
     pub fn rx_ready(&self) -> bool {

@@ -38,6 +38,7 @@
 .equ WDOG_BASE,       0x01C20CB8
 .equ IRQ_MASK0,       0x01C20430
 .equ IRQ_MASK1,       0x01C20434
+.equ INTC_BASE,       0x01C20400
 
 /* Speedup target: top of DRAM for fast execution during init */
 .equ SPEEDUP_ADDR,    0x81F80000
@@ -45,7 +46,7 @@
 /*
  * ── reset ──  Entry point from BROM
  */
-.section .text.spl
+.section .text.boot, "ax", %progbits   /* placed first by link.lds */
 .arm
 /*
  * Allwinner BROM boot header
@@ -106,6 +107,40 @@ reset:
     bne 1f
     ldr r1, =0x1
     str r1, [r0, #0x58]        /* Mark FEL boot at 0x58 */
+
+    /* FEL boot: the BROM's FEL USB handling is interrupt driven (its saved
+     * CPSR has I=0). Snapshot its INTC configuration before we mask every
+     * source below, so return_to_fel can hand it back intact. DRAM is
+     * already up ("xfel ddr") and the image sits at its link address, so
+     * the save area in .data is usable here. */
+    ldr r0, =INTC_BASE
+    ldr r1, =brom_intc_save
+    ldr r2, [r0, #0x04]
+    str r2, [r1, #0x00]        /* BASE_ADDR */
+    ldr r2, [r0, #0x20]
+    str r2, [r1, #0x04]        /* EN0 */
+    ldr r2, [r0, #0x24]
+    str r2, [r1, #0x08]        /* EN1 */
+    ldr r2, [r0, #0x30]
+    str r2, [r1, #0x0C]        /* MASK0 */
+    ldr r2, [r0, #0x34]
+    str r2, [r1, #0x10]        /* MASK1 */
+    ldr r2, [r0, #0x40]
+    str r2, [r1, #0x14]        /* RESP0 */
+    ldr r2, [r0, #0x44]
+    str r2, [r1, #0x18]        /* RESP1 */
+    ldr r2, [r0, #0x50]
+    str r2, [r1, #0x1C]        /* FF0 */
+    ldr r2, [r0, #0x54]
+    str r2, [r1, #0x20]        /* FF1 */
+    ldr r2, [r0, #0x60]
+    str r2, [r1, #0x24]        /* PRIO0 */
+    ldr r2, [r0, #0x64]
+    str r2, [r1, #0x28]        /* PRIO1 */
+    ldr r2, [r0, #0x68]
+    str r2, [r1, #0x2C]        /* PRIO2 */
+    ldr r2, [r0, #0x6C]
+    str r2, [r1, #0x30]        /* PRIO3 */
 1:  nop
 
     /* Enter SVC mode and mask IRQ/FIQ interrupts */
@@ -165,11 +200,12 @@ reset:
     str r1, [r0], #0x04
     str r1, [r0]
 
-    /* Set up temporary SVC stack in SRAM (DRAM not available yet).
-     * All sections are linked at 0x80000000 (DRAM), so svc_stack_start
-     * resolves to a DRAM address which is invalid before dram::init().
-     * Use the top of F1C100s internal SRAM A (32 KB at 0x00000000). */
-    ldr sp, =0x00008000
+    /* SPL stack: keep running on the stack the BROM handed us (sp is
+     * untouched since entry), exactly like xboot. svc_stack_start is a DRAM
+     * address and unusable before dram::init(). Do NOT move sp to a fixed
+     * SRAM address (the top of SRAM, 0x8000, was used before): that clobbers
+     * the BROM's own stack frames, and return_to_fel then has no intact
+     * BROM state to return into. */
     bl low_level_init
 
     /*
@@ -260,7 +296,7 @@ memcpy:
  *
  * Clobbers: r0-r2 (init), r0-r2 (putc), r0-r5 (puts)
  */
-.section .text.spl
+.section .text.boot, "ax", %progbits   /* same section as reset: adr refs to spl_exc_* */
 early_uart2_init:
     /* ── 1. GPIO mux: PE7 = TX, PE8 = RX (FUNC2 = 0x3) ──────────── */
     ldr r0, =0x01C20890         @ Port E CFG0 (pins 0-7)
@@ -479,6 +515,14 @@ memset:
  * Stack space for each CPU mode
  */
 .section .data
+/* BROM INTC configuration captured at reset on FEL boot (see reset),
+ * restored by return_to_fel: BASE_ADDR, EN0/1, MASK0/1, RESP0/1, FF0/1,
+ * PRIO0-3 — 13 words. */
+    .align 2
+    .global brom_intc_save
+brom_intc_save:
+    .space 13 * 4
+
     .space UND_STACK_SIZE
     .align 3
     .global und_stack_start
@@ -635,3 +679,124 @@ _data_start:    .long __data_start
 _data_end:      .long __data_end
 _bss_start:     .long __bss_start
 _bss_end:       .long __bss_end
+
+/*
+ * return_to_fel - hand the CPU back to the BROM in FEL (USB boot) mode.
+ *
+ * Same mechanism as xboot's mach-f1c100s return_to_fel: rewrite the boot
+ * header signature at SRAM 0x4 to "eGON.FEL", restore the sp / lr / CPSR /
+ * CP15 control the BROM had when it called _start (saved at 0x40 by reset),
+ * and return into the BROM's FEL loop. That only works when we were started
+ * by "xfel exec" (FEL flag at 0x58). After an SPI-flash boot the BROM caller
+ * ignores the signature, so that case jumps to the BROM FEL entry
+ * (0xffff0020) instead — see label 3 below.
+ *
+ * Unlike xboot we run with MMU + D-cache on, so the whole D-cache is
+ * cleaned first and caches / TLB are invalidated after the CP15 restore
+ * turns them off.
+ */
+.section .text
+.global return_to_fel
+return_to_fel:
+    mrs r0, cpsr
+    orr r0, r0, #NOINT
+    msr cpsr_c, r0
+
+    /* Clean + invalidate the entire D-cache (ARM926 test-clean-invalidate) */
+1:  mrc p15, 0, apsr_nzcv, c7, c14, 3   /* r15 form: flags <- dirty status */
+    bne 1b
+    mov r0, #0
+    mcr p15, 0, r0, c7, c10, 4   /* drain write buffer */
+
+    /* Boot header signature "eGON.BT0" -> "eGON.FEL" */
+    mov r0, #0x4
+    ldr r1, =0x4e4f4765          /* "eGON" */
+    str r1, [r0, #0]
+    ldr r1, =0x4c45462e          /* ".FEL" */
+    str r1, [r0, #4]
+
+    /* FEL boot: give the BROM back its INTC setup (FEL USB is IRQ driven).
+     * Flash boot takes the BROM FEL-entry path at 3: instead. */
+    mov r0, #0
+    ldr r1, [r0, #0x58]
+    cmp r1, #1
+    bne 3f
+    ldr r0, =INTC_BASE
+    ldr r1, =brom_intc_save
+    mov r2, #0
+    str r2, [r0, #0x20]        /* disable all while reprogramming */
+    str r2, [r0, #0x24]
+    ldr r2, [r1, #0x00]
+    str r2, [r0, #0x04]        /* BASE_ADDR */
+    ldr r2, [r1, #0x0C]
+    str r2, [r0, #0x30]        /* MASK0 */
+    ldr r2, [r1, #0x10]
+    str r2, [r0, #0x34]        /* MASK1 */
+    ldr r2, [r1, #0x14]
+    str r2, [r0, #0x40]        /* RESP0 */
+    ldr r2, [r1, #0x18]
+    str r2, [r0, #0x44]        /* RESP1 */
+    ldr r2, [r1, #0x1C]
+    str r2, [r0, #0x50]        /* FF0 */
+    ldr r2, [r1, #0x20]
+    str r2, [r0, #0x54]        /* FF1 */
+    ldr r2, [r1, #0x24]
+    str r2, [r0, #0x60]        /* PRIO0 */
+    ldr r2, [r1, #0x28]
+    str r2, [r0, #0x64]        /* PRIO1 */
+    ldr r2, [r1, #0x2C]
+    str r2, [r0, #0x68]        /* PRIO2 */
+    ldr r2, [r1, #0x30]
+    str r2, [r0, #0x6C]        /* PRIO3 */
+    ldr r2, [r1, #0x04]
+    str r2, [r0, #0x20]        /* EN0 last */
+    ldr r2, [r1, #0x08]
+    str r2, [r0, #0x24]        /* EN1 */
+2:
+    /* Restore BROM state saved at 0x40 by reset */
+    ldr r0, =0x00000040
+    ldr sp, [r0, #0]
+    ldr lr, [r0, #4]
+    ldr r1, [r0, #16]
+    mcr p15, 0, r1, c1, c0, 0    /* BROM CP15 control: MMU / caches off, high vectors */
+    mov r1, #0
+    mcr p15, 0, r1, c7, c7, 0    /* invalidate I + D caches */
+    mcr p15, 0, r1, c8, c7, 0    /* invalidate TLB */
+    ldr r1, [r0, #8]
+    msr cpsr_cxsf, r1
+    bx lr
+
+3:  /* Flash boot: the BROM's SPI-boot caller (lr = 0xffff417c) does not look
+     * at "eGON.FEL" — returning there just hangs (measured). Enter FEL
+     * through the BROM's own FEL entry vector instead (BROM dump:
+     * 0xffff0020 -> 0xffff003c sets IRQ/SVC stacks at 0x2000/0x7000, turns
+     * MMU/caches off, sets CPU/AHB clocks, enables USB PHY/OTG clock+reset
+     * and runs the FEL loop at 0xffff2018).
+     * It relies on high vectors (CP15 V=1) for its USB interrupt and on
+     * the INTC being in its power-on state, so put both back first. */
+    ldr r0, =INTC_BASE
+    mov r1, #0
+    str r1, [r0, #0x20]        /* EN0 */
+    str r1, [r0, #0x24]        /* EN1 */
+    str r1, [r0, #0x30]        /* MASK0 (power-on: unmasked) */
+    str r1, [r0, #0x34]        /* MASK1 */
+    str r1, [r0, #0x04]        /* BASE_ADDR */
+    str r1, [r0, #0x40]        /* RESP0 */
+    str r1, [r0, #0x44]        /* RESP1 */
+    str r1, [r0, #0x50]        /* FF0 */
+    str r1, [r0, #0x54]        /* FF1 */
+    str r1, [r0, #0x60]        /* PRIO0-3 */
+    str r1, [r0, #0x64]
+    str r1, [r0, #0x68]
+    str r1, [r0, #0x6C]
+
+    ldr r0, =0x00000040
+    ldr r1, [r0, #16]
+    mcr p15, 0, r1, c1, c0, 0    /* BROM CP15 control: MMU / caches off, V=1 */
+    mov r1, #0
+    mcr p15, 0, r1, c7, c7, 0    /* invalidate I + D caches */
+    mcr p15, 0, r1, c8, c7, 0    /* invalidate TLB */
+    mov r1, #0xd3                /* SVC, IRQ + FIQ masked */
+    msr cpsr_c, r1
+    ldr pc, =0xffff0020          /* BROM FEL entry */
+    .ltorg

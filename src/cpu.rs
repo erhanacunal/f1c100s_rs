@@ -249,6 +249,25 @@ unsafe fn read32(addr: u32) -> u32 { (addr as *const u32).read_volatile() }
 #[inline]
 unsafe fn write32(addr: u32, val: u32) { (addr as *mut u32).write_volatile(val); }
 
+extern "C" {
+    /// `startup.s`: restore the BROM's saved state and return into it with
+    /// the boot header signature set to `eGON.FEL`.
+    fn return_to_fel() -> !;
+}
+
+/// Drop back into the BROM's FEL (USB download) mode without pressing BOOT.
+///
+/// Masks every interrupt, stops the watchdog, flushes the D-cache, turns the
+/// MMU off and returns into the BROM (xboot's `return_to_fel` mechanism).
+/// `xfel` can talk to the board again afterwards. Flush any pending UART
+/// output (`Uart::flush`) before calling.
+pub fn enter_fel() -> ! {
+    interrupt_disable();
+    crate::interrupt::init(); // mask + disable all INTC sources
+    disable_watchdog();
+    unsafe { return_to_fel() }
+}
+
 pub fn cpu_reset() -> ! {
     unsafe {
         let mut val = read32(0x01c20ca0 + 0x18); // Watchdog mode register
