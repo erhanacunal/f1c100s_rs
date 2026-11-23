@@ -25,3 +25,7 @@ path = "docs/examples/spi_dma_demo.rs"
 [[example]]
 name = "fbdma_demo"
 path = "docs/examples/fbdma_demo.rs"
+
+[[example]]
+name = "fbdma_panel_demo"
+path = "docs/examples/fbdma_panel_demo.rs"
