@@ -12,3 +12,8 @@ log = { version = "0.4", default-features = false }
 
 [features]
 default = []
+
+# Hardware examples (flash with tools/flash.ps1 -Example <name>)
+[[example]]
+name = "dma_demo"
+path = "docs/examples/dma_demo.rs"

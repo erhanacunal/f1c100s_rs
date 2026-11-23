@@ -40,6 +40,7 @@ runtime dependencies beyond the `log` facade.
 | Module        | Description                                                        |
 | ------------- | ------------------------------------------------------------------ |
 | `clock`       | Clock Control Unit (CCU): PLLs, dividers, bus gating, resets       |
+| `dma`         | 8-channel DMA (4 normal + 4 dedicated), chunking, cyclic mode     |
 | `gpio`        | GPIO ports A–F, with edge/level interrupts on ports D/E/F          |
 | `uart`        | Three 16550-compatible UARTs (64-byte FIFOs)                       |
 | `i2c`         | Three TWI/I²C master controllers (standard + fast mode)           |
