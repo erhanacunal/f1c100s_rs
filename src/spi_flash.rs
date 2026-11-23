@@ -90,11 +90,17 @@ impl<'a> SpiFlash<'a> {
 
     /// Read the 3-byte JEDEC ID (manufacturer, memory_type, capacity)
     pub fn read_jedec_id(&self) -> Result<[u8; 3], FlashError> {
-        let mut id = [0u8; 3];
+        let mut id = [0u8; 4];
         self.spi.xfer(&[cmd::READ_JEDEC_ID, 0, 0, 0], &mut id)?;
-        // Response is in bytes 1–3 (byte 0 is dummy during command phase)
-        let result = [id[1], id[2], id[0]]; // reorder for typical manuf-type-capacity
-        Ok(result)
+        // Byte 0 is clocked in during the command byte; the ID follows.
+        Ok([id[1], id[2], id[3]])
+    }
+
+    /// Flash size in bytes from the JEDEC capacity byte (2^capacity),
+    /// or `None` if the ID looks invalid.
+    pub fn size_bytes(&self) -> Result<Option<u32>, FlashError> {
+        let [_, _, cap] = self.read_jedec_id()?;
+        Ok(if (0x10..=0x1F).contains(&cap) { Some(1u32 << cap) } else { None })
     }
 
     /// Read the 8-byte unique ID
